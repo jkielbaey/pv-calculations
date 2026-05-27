@@ -1,0 +1,13 @@
+[tool.poetry]
+name = "pv-calculations"
+version = "0.1.0"
+description = "Nordpool day-ahead electricity price fetcher and battery charging advisor"
+authors = ["Johan Kielbaey <johan.kielbaey@gmail.com>"]
+
+[tool.poetry.dependencies]
+python = "^3.14"
+boto3 = "*"
+
+[build-system]
+requires = ["poetry-core"]
+build-backend = "poetry.core.masonry.api"
