@@ -1,0 +1,28 @@
+{
+  "multiAreaEntries": [
+    {"deliveryStart": "2025-07-14T22:00:00Z", "entryPerArea": {"BE":  30.00}},
+    {"deliveryStart": "2025-07-14T23:00:00Z", "entryPerArea": {"BE":  25.00}},
+    {"deliveryStart": "2025-07-15T00:00:00Z", "entryPerArea": {"BE":  20.00}},
+    {"deliveryStart": "2025-07-15T01:00:00Z", "entryPerArea": {"BE":  18.00}},
+    {"deliveryStart": "2025-07-15T02:00:00Z", "entryPerArea": {"BE":  15.00}},
+    {"deliveryStart": "2025-07-15T03:00:00Z", "entryPerArea": {"BE":  22.00}},
+    {"deliveryStart": "2025-07-15T04:00:00Z", "entryPerArea": {"BE":  35.00}},
+    {"deliveryStart": "2025-07-15T05:00:00Z", "entryPerArea": {"BE":  50.00}},
+    {"deliveryStart": "2025-07-15T06:00:00Z", "entryPerArea": {"BE":  65.00}},
+    {"deliveryStart": "2025-07-15T07:00:00Z", "entryPerArea": {"BE":  80.00}},
+    {"deliveryStart": "2025-07-15T08:00:00Z", "entryPerArea": {"BE":  90.00}},
+    {"deliveryStart": "2025-07-15T09:00:00Z", "entryPerArea": {"BE":  75.00}},
+    {"deliveryStart": "2025-07-15T10:00:00Z", "entryPerArea": {"BE":  40.00}},
+    {"deliveryStart": "2025-07-15T11:00:00Z", "entryPerArea": {"BE":  10.00}},
+    {"deliveryStart": "2025-07-15T12:00:00Z", "entryPerArea": {"BE":  -5.00}},
+    {"deliveryStart": "2025-07-15T13:00:00Z", "entryPerArea": {"BE": -10.00}},
+    {"deliveryStart": "2025-07-15T14:00:00Z", "entryPerArea": {"BE":  -8.00}},
+    {"deliveryStart": "2025-07-15T15:00:00Z", "entryPerArea": {"BE":   5.00}},
+    {"deliveryStart": "2025-07-15T16:00:00Z", "entryPerArea": {"BE":  55.00}},
+    {"deliveryStart": "2025-07-15T17:00:00Z", "entryPerArea": {"BE": 110.00}},
+    {"deliveryStart": "2025-07-15T18:00:00Z", "entryPerArea": {"BE": 140.00}},
+    {"deliveryStart": "2025-07-15T19:00:00Z", "entryPerArea": {"BE": 120.00}},
+    {"deliveryStart": "2025-07-15T20:00:00Z", "entryPerArea": {"BE":  85.00}},
+    {"deliveryStart": "2025-07-15T21:00:00Z", "entryPerArea": {"BE":  45.00}}
+  ]
+}

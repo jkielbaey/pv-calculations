@@ -1,9 +1,12 @@
 #!/usr/bin/env python3
 import urllib.request
 import json
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta
 from collections import defaultdict
+from zoneinfo import ZoneInfo
 import boto3
+
+BRUSSELS = ZoneInfo("Europe/Brussels")
 
 NORDPOOL_URL = (
     "https://dataportal-api.nordpoolgroup.com/api/DayAheadPrices"
@@ -32,14 +35,11 @@ def parse_entries(data):
 
     hourly = defaultdict(list)
 
-    cet = timezone(timedelta(hours=1))  # CET (no DST logic, but fine for winter)
-
     for e in entries:
         ts_utc = datetime.fromisoformat(e["deliveryStart"].replace("Z", "+00:00"))
         price = e["entryPerArea"]["BE"]
 
-        # Convert to CET
-        ts_cet = ts_utc.astimezone(cet)
+        ts_cet = ts_utc.astimezone(BRUSSELS)
 
         # Floor to hour
         hour = ts_cet.replace(minute=0, second=0, microsecond=0)
@@ -93,9 +93,8 @@ def summarize_hours(marked):
     return "\n".join(text)
 
 def mark_cheapest(hours, n=12):
-    # Find cheapest N by price in before 21h. No point on charging the batter
-    # past 21h to save cost.
-    sorted_by_price = sorted(hours[:21], key=lambda x: x[1])
+    before_21 = [(h, p) for h, p in hours if h.hour < 21]
+    sorted_by_price = sorted(before_21, key=lambda x: x[1])
     cutoff = set(sorted_by_price[:n])
     return [(h, p, "*" if (h, p) in cutoff else "") for h, p in hours]
 
@@ -117,8 +116,7 @@ def explanatory_text():
     )
 
 def prepare_email():
-    cet = timezone(timedelta(hours=1))
-    now = datetime.now(cet)
+    now = datetime.now(BRUSSELS)
 
     if now.hour < 14:
         target_date = now.strftime("%Y-%m-%d")
