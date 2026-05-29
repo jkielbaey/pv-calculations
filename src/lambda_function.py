@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+import math
 import urllib.request
 import json
 import os
@@ -76,6 +77,29 @@ def _fusionsolar_get_soc(token):
     return entries[0].get("dataItemMap", {}).get("battery_soc")
 
 
+def _fetch_fusionsolar_data(days=7):
+    if not all([os.getenv("FUSIONSOLAR_USER"), os.getenv("FUSIONSOLAR_PASSWORD")]):
+        return {"soc": None, "avg_consumption": None}
+    has_soc = bool(os.getenv("FUSIONSOLAR_DEVICE_ID"))
+    has_cons = bool(os.getenv("FUSIONSOLAR_PLANT_ID"))
+    def _fetch(token):
+        return {
+            "soc": _fusionsolar_get_soc(token) if has_soc else None,
+            "avg_consumption": _fusionsolar_get_avg_consumption(token, days) if has_cons else None,
+        }
+    try:
+        token = _fusionsolar_login()
+        if not token:
+            return {"soc": None, "avg_consumption": None}
+        try:
+            return _fetch(token)
+        except _SessionExpired:
+            token = _fusionsolar_login()
+            return _fetch(token) if token else {"soc": None, "avg_consumption": None}
+    except Exception:
+        return {"soc": None, "avg_consumption": None}
+
+
 def fetch_current_soc():
     if not all([os.getenv("FUSIONSOLAR_USER"), os.getenv("FUSIONSOLAR_PASSWORD"), os.getenv("FUSIONSOLAR_DEVICE_ID")]):
         return None
@@ -92,6 +116,176 @@ def fetch_current_soc():
             return _fusionsolar_get_soc(token)
     except Exception:
         return None
+
+
+def _fusionsolar_get_avg_consumption(token, days=7):
+    host = os.getenv("FUSIONSOLAR_HOST", "eu5.fusionsolar.huawei.com")
+    plant_id = os.getenv("FUSIONSOLAR_PLANT_ID")
+    today_utc = datetime.now(ZoneInfo("UTC")).replace(hour=0, minute=0, second=0, microsecond=0)
+    values = []
+    for i in range(1, days + 1):
+        collect_time = int((today_utc - timedelta(days=i)).timestamp() * 1000)
+        body = json.dumps({"stationCodes": plant_id, "collectTime": collect_time}).encode()
+        req = urllib.request.Request(
+            f"https://{host}/thirdData/getKpiStationDay",
+            data=body,
+            headers={"Content-Type": "application/json", "XSRF-TOKEN": token},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        if not data.get("success"):
+            if data.get("failCode") in (305, 306, 307):
+                raise _SessionExpired()
+            continue
+        entries = data.get("data") or []
+        if not entries:
+            continue
+        use_power = entries[0].get("dataItemMap", {}).get("use_power")
+        if use_power is not None and use_power > 0:
+            values.append(use_power)
+    return sum(values) / len(values) if values else None
+
+
+def fetch_avg_daily_consumption(days=7):
+    if not all([os.getenv("FUSIONSOLAR_USER"), os.getenv("FUSIONSOLAR_PASSWORD"), os.getenv("FUSIONSOLAR_PLANT_ID")]):
+        return None
+    try:
+        token = _fusionsolar_login()
+        if not token:
+            return None
+        try:
+            return _fusionsolar_get_avg_consumption(token, days)
+        except _SessionExpired:
+            token = _fusionsolar_login()
+            if not token:
+                return None
+            return _fusionsolar_get_avg_consumption(token, days)
+    except Exception:
+        return None
+
+
+BATTERY_CAPACITY_KWH = 15
+MAX_CHARGE_RATE_KW = 5
+MIN_SOC_PCT = 15
+TARGET_CHARGE_SOC_PCT = 90
+MIN_SAVING_EUR = 1.00
+
+_OVERNIGHT_HOURS = set(range(8)) | {22, 23}
+
+
+def classify_scenario(forecast_kwh, current_soc, avg_consumption):
+    current_stored = (current_soc / 100) * BATTERY_CAPACITY_KWH
+    solar_surplus = max(0.0, forecast_kwh - avg_consumption)
+    if current_stored + solar_surplus > BATTERY_CAPACITY_KWH:
+        return "EXCESS"
+    if current_stored + forecast_kwh < avg_consumption:
+        return "DEFICIT"
+    return "BALANCED"
+
+
+def find_negative_price_window(prices):
+    block_start = None
+    last_h = None
+    for h, p in prices:
+        if p < 0:
+            if block_start is None:
+                block_start = h
+        else:
+            if block_start is not None:
+                return (block_start, h)
+        last_h = h
+    if block_start is not None:
+        return (block_start, last_h + timedelta(hours=1))
+    return None
+
+
+def find_cheapest_overnight_window(prices, charge_kwh):
+    overnight = [(h, p) for h, p in prices if h.hour in _OVERNIGHT_HOURS]
+    late = [(h, p) for h, p in overnight if h.hour >= 22]
+    early = [(h, p) for h, p in overnight if h.hour < 8]
+    ordered = late + early
+
+    window_size = max(1, math.ceil(charge_kwh / MAX_CHARGE_RATE_KW))
+    best_idx = 0
+    best_avg = float("inf")
+    for i in range(len(ordered) - window_size + 1):
+        avg = sum(p for _, p in ordered[i:i + window_size]) / window_size
+        if avg < best_avg:
+            best_avg = avg
+            best_idx = i
+
+    start = ordered[best_idx][0]
+    return (start, start + timedelta(hours=window_size))
+
+
+def recommend_action(scenario, prices, current_soc, forecast_kwh):
+    _no_action = {
+        "action": "NO_ACTION",
+        "start_time": None,
+        "end_time": None,
+        "target_soc": None,
+        "rationale": "No action required.",
+        "estimated_saving": 0.0,
+    }
+
+    if prices is None or current_soc is None or forecast_kwh is None:
+        return {**_no_action, "rationale": "Insufficient data."}
+
+    if scenario == "EXCESS":
+        neg = find_negative_price_window(prices)
+        if neg:
+            discharge_kwh = (current_soc / 100 - MIN_SOC_PCT / 100) * BATTERY_CAPACITY_KWH
+            duration_h = discharge_kwh / MAX_CHARGE_RATE_KW
+            start_time = neg[0] - timedelta(hours=duration_h)
+            return {
+                "action": "FORCE_DISCHARGE",
+                "start_time": start_time,
+                "end_time": neg[1],
+                "target_soc": MIN_SOC_PCT,
+                "rationale": (
+                    f"Battery overflow likely. Discharge {discharge_kwh:.1f} kWh "
+                    f"before negative price window at {neg[0].strftime('%H:%M')}."
+                ),
+                "estimated_saving": 0.0,
+            }
+        return {**_no_action, "action": "MONITOR", "rationale": "Battery likely to overflow; no negative prices detected."}
+
+    if scenario == "DEFICIT":
+        charge_kwh = (TARGET_CHARGE_SOC_PCT / 100 - current_soc / 100) * BATTERY_CAPACITY_KWH
+        if charge_kwh <= 0:
+            return _no_action
+
+        win_start, win_end = find_cheapest_overnight_window(prices, charge_kwh)
+
+        price_by_hour = {h.hour: p for h, p in prices}
+        win_prices = []
+        h = win_start
+        while h < win_end:
+            if h.hour in price_by_hour:
+                win_prices.append(price_by_hour[h.hour])
+            h += timedelta(hours=1)
+        avg_win = sum(win_prices) / len(win_prices) if win_prices else 0.0
+
+        daytime = [p for h, p in prices if h.hour not in _OVERNIGHT_HOURS]
+        avg_day = sum(daytime) / len(daytime) if daytime else 0.0
+
+        saving = round(charge_kwh * (avg_day - avg_win) / 1000, 2)
+        if saving > MIN_SAVING_EUR:
+            return {
+                "action": "FORCE_CHARGE",
+                "start_time": win_start,
+                "end_time": win_end,
+                "target_soc": TARGET_CHARGE_SOC_PCT,
+                "rationale": (
+                    f"Deficit scenario. Charge {charge_kwh:.1f} kWh overnight "
+                    f"({win_start.strftime('%H:%M')}–{win_end.strftime('%H:%M')}). "
+                    f"Window avg {avg_win:.0f} vs daytime avg {avg_day:.0f} €/MWh."
+                ),
+                "estimated_saving": saving,
+            }
+
+    return _no_action
 
 
 def fetch_solar_forecast(date_str):
@@ -218,7 +412,9 @@ def prepare_email():
 
     marked = mark_cheapest(parse_entries(fetch_prices(target_date)))
     forecast_kwh = fetch_solar_forecast(target_date)
-    soc = fetch_current_soc()
+    fusionsolar = _fetch_fusionsolar_data()
+    soc = fusionsolar["soc"]
+    avg_consumption = fusionsolar["avg_consumption"]
 
     forecast_line = (
         f"Solar forecast: {forecast_kwh:.1f} kWh\n" if forecast_kwh is not None
@@ -228,8 +424,12 @@ def prepare_email():
         f"Battery SOC: {soc:.0f}%\n" if soc is not None
         else "Battery SOC: unavailable\n"
     )
+    consumption_line = (
+        f"Avg daily consumption (7d): {avg_consumption:.1f} kWh\n" if avg_consumption is not None
+        else "Avg daily consumption (7d): unavailable\n"
+    )
 
-    body = explanatory_text() + forecast_line + soc_line + "\n" + summarize_hours(marked) + "\n" + format_table(marked)
+    body = explanatory_text() + forecast_line + soc_line + consumption_line + "\n" + summarize_hours(marked) + "\n" + format_table(marked)
     return target_date, f"Nordpool prices for {target_date}", body
 
 
