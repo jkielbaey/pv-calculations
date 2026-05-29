@@ -7,6 +7,7 @@ authors = ["Johan Kielbaey <johan.kielbaey@gmail.com>"]
 [tool.poetry.dependencies]
 python = "^3.14"
 boto3 = "*"
+python-dotenv = "*"
 
 [tool.poetry.group.dev.dependencies]
 pytest = "*"

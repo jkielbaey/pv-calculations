@@ -1,10 +1,14 @@
 #!/usr/bin/env python3
 import urllib.request
 import json
+import os
 from datetime import datetime, timedelta
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 import boto3
+from dotenv import load_dotenv
+
+load_dotenv()
 
 BRUSSELS = ZoneInfo("Europe/Brussels")
 
@@ -22,6 +26,30 @@ HEADERS = {
 }
 
 MAIL_ADDRESS = "we@kielbaey-oliveros.eu"
+
+FORECAST_SOLAR_URL = "https://api.forecast.solar/{key}/estimate/{lat}/{lon}/{dec}/{az}/{kwp}"
+
+def fetch_solar_forecast(date_str):
+    key = os.getenv("FORECAST_SOLAR_API_KEY")
+    lat = os.getenv("SOLAR_LAT")
+    lon = os.getenv("SOLAR_LON")
+    dec = os.getenv("SOLAR_DECLINATION")
+    az  = os.getenv("SOLAR_AZIMUTH")
+    kwp = os.getenv("SOLAR_KWP")
+
+    if not all([key, lat, lon, dec, az, kwp]):
+        return None
+
+    url = FORECAST_SOLAR_URL.format(key=key, lat=lat, lon=lon, dec=dec, az=az, kwp=kwp)
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        wh = data["result"]["watt_hours_day"].get(date_str)
+        return wh / 1000 if wh is not None else None
+    except Exception:
+        return None
+
 
 def fetch_prices(date_str):
     url = NORDPOOL_URL.format(date=date_str)
@@ -124,7 +152,14 @@ def prepare_email():
         target_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
     marked = mark_cheapest(parse_entries(fetch_prices(target_date)))
-    body = explanatory_text() + "\n" + summarize_hours(marked) + "\n" + format_table(marked)
+    forecast_kwh = fetch_solar_forecast(target_date)
+
+    forecast_line = (
+        f"Solar forecast: {forecast_kwh:.1f} kWh\n" if forecast_kwh is not None
+        else "Solar forecast: unavailable\n"
+    )
+
+    body = explanatory_text() + forecast_line + "\n" + summarize_hours(marked) + "\n" + format_table(marked)
     return target_date, f"Nordpool prices for {target_date}", body
 
 

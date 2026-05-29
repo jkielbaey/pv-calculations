@@ -2,9 +2,10 @@ import json
 import pytest
 from datetime import datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch, MagicMock
 from zoneinfo import ZoneInfo
 
-from lambda_function import parse_entries, mark_cheapest, summarize_hours, format_table
+from lambda_function import parse_entries, mark_cheapest, summarize_hours, format_table, fetch_solar_forecast
 
 BRUSSELS = ZoneInfo("Europe/Brussels")
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -158,3 +159,62 @@ class TestFormatTable:
         marked = mark_cheapest(winter_hours)
         table = format_table(marked)
         assert "2025-01-15" in table
+
+
+# ── fetch_solar_forecast ─────────────────────────────────────────────────────
+
+SOLAR_ENV = {
+    "FORECAST_SOLAR_API_KEY": "testkey",
+    "SOLAR_LAT": "51.0",
+    "SOLAR_LON": "4.0",
+    "SOLAR_DECLINATION": "35",
+    "SOLAR_AZIMUTH": "0",
+    "SOLAR_KWP": "10.0",
+}
+
+FORECAST_RESPONSE = json.dumps({
+    "result": {
+        "watt_hours_day": {
+            "2025-07-15": 18500,
+            "2025-07-16": 21000,
+        }
+    }
+}).encode()
+
+
+class TestFetchSolarForecast:
+    def _mock_urlopen(self, payload=FORECAST_RESPONSE):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = payload
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return patch("urllib.request.urlopen", return_value=mock_resp)
+
+    def test_returns_kwh_for_date(self):
+        with patch.dict("os.environ", SOLAR_ENV):
+            with self._mock_urlopen():
+                result = fetch_solar_forecast("2025-07-15")
+        assert result == pytest.approx(18.5)
+
+    def test_returns_none_when_date_missing_from_response(self):
+        with patch.dict("os.environ", SOLAR_ENV):
+            with self._mock_urlopen():
+                result = fetch_solar_forecast("2025-07-17")
+        assert result is None
+
+    def test_returns_none_when_env_vars_missing(self):
+        with patch.dict("os.environ", {}, clear=True):
+            result = fetch_solar_forecast("2025-07-15")
+        assert result is None
+
+    def test_returns_none_on_network_error(self):
+        with patch.dict("os.environ", SOLAR_ENV):
+            with patch("urllib.request.urlopen", side_effect=OSError("timeout")):
+                result = fetch_solar_forecast("2025-07-15")
+        assert result is None
+
+    def test_returns_none_on_malformed_response(self):
+        with patch.dict("os.environ", SOLAR_ENV):
+            with self._mock_urlopen(b"not-json"):
+                result = fetch_solar_forecast("2025-07-15")
+        assert result is None
