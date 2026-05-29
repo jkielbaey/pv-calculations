@@ -31,6 +31,69 @@ MAIL_ADDRESS = "we@kielbaey-oliveros.eu"
 
 FORECAST_SOLAR_URL = "https://api.forecast.solar/{key}/estimate/{lat}/{lon}/{dec}/{az}/{kwp}"
 
+
+class _SessionExpired(Exception):
+    pass
+
+
+def _fusionsolar_login():
+    host = os.getenv("FUSIONSOLAR_HOST", "eu5.fusionsolar.huawei.com")
+    user = os.getenv("FUSIONSOLAR_USER")
+    pwd = os.getenv("FUSIONSOLAR_PASSWORD")
+    body = json.dumps({"userName": user, "systemCode": pwd}).encode()
+    req = urllib.request.Request(
+        f"https://{host}/thirdData/login",
+        data=body,
+        headers={"Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+        if not data.get("success"):
+            return None
+        return resp.headers.get("xsrf-token")
+
+
+def _fusionsolar_get_soc(token):
+    host = os.getenv("FUSIONSOLAR_HOST", "eu5.fusionsolar.huawei.com")
+    device_id = os.getenv("FUSIONSOLAR_DEVICE_ID")
+    body = json.dumps({"devIds": device_id, "devTypeId": 39}).encode()
+    req = urllib.request.Request(
+        f"https://{host}/thirdData/getDevRealKpi",
+        data=body,
+        headers={"Content-Type": "application/json", "XSRF-TOKEN": token},
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        data = json.loads(resp.read())
+    if not data.get("success"):
+        if data.get("failCode") in (305, 306, 307):
+            raise _SessionExpired()
+        return None
+    entries = data.get("data") or []
+    if not entries:
+        return None
+    return entries[0].get("dataItemMap", {}).get("battery_soc")
+
+
+def fetch_current_soc():
+    if not all([os.getenv("FUSIONSOLAR_USER"), os.getenv("FUSIONSOLAR_PASSWORD"), os.getenv("FUSIONSOLAR_DEVICE_ID")]):
+        return None
+    try:
+        token = _fusionsolar_login()
+        if not token:
+            return None
+        try:
+            return _fusionsolar_get_soc(token)
+        except _SessionExpired:
+            token = _fusionsolar_login()
+            if not token:
+                return None
+            return _fusionsolar_get_soc(token)
+    except Exception:
+        return None
+
+
 def fetch_solar_forecast(date_str):
     key = os.getenv("FORECAST_SOLAR_API_KEY")
     lat = os.getenv("SOLAR_LAT")
@@ -155,13 +218,18 @@ def prepare_email():
 
     marked = mark_cheapest(parse_entries(fetch_prices(target_date)))
     forecast_kwh = fetch_solar_forecast(target_date)
+    soc = fetch_current_soc()
 
     forecast_line = (
         f"Solar forecast: {forecast_kwh:.1f} kWh\n" if forecast_kwh is not None
         else "Solar forecast: unavailable\n"
     )
+    soc_line = (
+        f"Battery SOC: {soc:.0f}%\n" if soc is not None
+        else "Battery SOC: unavailable\n"
+    )
 
-    body = explanatory_text() + forecast_line + "\n" + summarize_hours(marked) + "\n" + format_table(marked)
+    body = explanatory_text() + forecast_line + soc_line + "\n" + summarize_hours(marked) + "\n" + format_table(marked)
     return target_date, f"Nordpool prices for {target_date}", body
 
 

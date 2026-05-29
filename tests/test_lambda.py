@@ -5,7 +5,7 @@ from pathlib import Path
 from unittest.mock import patch, MagicMock
 from zoneinfo import ZoneInfo
 
-from lambda_function import parse_entries, mark_cheapest, summarize_hours, format_table, fetch_solar_forecast
+from lambda_function import parse_entries, mark_cheapest, summarize_hours, format_table, fetch_solar_forecast, fetch_current_soc
 
 BRUSSELS = ZoneInfo("Europe/Brussels")
 FIXTURES = Path(__file__).parent / "fixtures"
@@ -217,4 +217,91 @@ class TestFetchSolarForecast:
         with patch.dict("os.environ", SOLAR_ENV):
             with self._mock_urlopen(b"not-json"):
                 result = fetch_solar_forecast("2025-07-15")
+        assert result is None
+
+
+# ── fetch_current_soc ─────────────────────────────────────────────────────────
+
+FUSIONSOLAR_ENV = {
+    "FUSIONSOLAR_USER": "testuser",
+    "FUSIONSOLAR_PASSWORD": "testpass",
+    "FUSIONSOLAR_DEVICE_ID": "1000000165855596",
+    "FUSIONSOLAR_HOST": "eu5.fusionsolar.huawei.com",
+}
+
+LOGIN_RESPONSE = json.dumps({"success": True, "failCode": 0, "data": None}).encode()
+SOC_RESPONSE = json.dumps({
+    "success": True,
+    "failCode": 0,
+    "data": [{
+        "devId": 1000000165855596,
+        "dataItemMap": {"battery_soc": 39.0, "rated_capacity": 15.0},
+    }],
+}).encode()
+SESSION_EXPIRED_RESPONSE = json.dumps({"success": False, "failCode": 305}).encode()
+
+
+class TestFetchCurrentSoc:
+    def _mock_resp(self, payload, token="test-token"):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = payload
+        mock_resp.headers.get = lambda key, default=None: token if key == "xsrf-token" else default
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return mock_resp
+
+    def _mock_urlopen(self, responses):
+        """responses: list of (payload, token) tuples, one per urlopen call."""
+        mocks = [self._mock_resp(p, t) for p, t in responses]
+        return patch("urllib.request.urlopen", side_effect=mocks)
+
+    def test_returns_soc_value(self):
+        with patch.dict("os.environ", FUSIONSOLAR_ENV):
+            with self._mock_urlopen([(LOGIN_RESPONSE, "tok"), (SOC_RESPONSE, None)]):
+                result = fetch_current_soc()
+        assert result == pytest.approx(39.0)
+
+    def test_returns_none_when_env_vars_missing(self):
+        with patch.dict("os.environ", {}, clear=True):
+            result = fetch_current_soc()
+        assert result is None
+
+    def test_returns_none_on_network_error(self):
+        with patch.dict("os.environ", FUSIONSOLAR_ENV):
+            with patch("urllib.request.urlopen", side_effect=OSError("timeout")):
+                result = fetch_current_soc()
+        assert result is None
+
+    def test_returns_none_on_login_failure(self):
+        failed_login = json.dumps({"success": False, "failCode": 1}).encode()
+        with patch.dict("os.environ", FUSIONSOLAR_ENV):
+            with self._mock_urlopen([(failed_login, None)]):
+                result = fetch_current_soc()
+        assert result is None
+
+    def test_retries_on_session_expired(self):
+        with patch.dict("os.environ", FUSIONSOLAR_ENV):
+            with self._mock_urlopen([
+                (LOGIN_RESPONSE, "tok1"),       # first login
+                (SESSION_EXPIRED_RESPONSE, None),  # first KPI → expired
+                (LOGIN_RESPONSE, "tok2"),       # retry login
+                (SOC_RESPONSE, None),           # retry KPI → success
+            ]):
+                result = fetch_current_soc()
+        assert result == pytest.approx(39.0)
+
+    def test_returns_none_when_soc_absent(self):
+        no_soc = json.dumps({
+            "success": True, "failCode": 0,
+            "data": [{"devId": 123, "dataItemMap": {}}],
+        }).encode()
+        with patch.dict("os.environ", FUSIONSOLAR_ENV):
+            with self._mock_urlopen([(LOGIN_RESPONSE, "tok"), (no_soc, None)]):
+                result = fetch_current_soc()
+        assert result is None
+
+    def test_returns_none_on_malformed_response(self):
+        with patch.dict("os.environ", FUSIONSOLAR_ENV):
+            with self._mock_urlopen([(LOGIN_RESPONSE, "tok"), (b"not-json", None)]):
+                result = fetch_current_soc()
         assert result is None
