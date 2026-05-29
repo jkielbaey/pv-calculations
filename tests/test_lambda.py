@@ -7,11 +7,13 @@ from zoneinfo import ZoneInfo
 
 from lambda_function import (
     parse_entries, mark_cheapest, summarize_hours, format_table,
-    fetch_solar_forecast, fetch_current_soc, fetch_median_daily_consumption,
+    fetch_solar_forecast, fetch_solar_hourly,
+    fetch_current_soc, fetch_median_daily_consumption,
     _fetch_fusionsolar_data,
     classify_scenario, find_negative_price_window,
     find_cheapest_overnight_window, recommend_action,
     format_recommendation, prepare_email,
+    simulate_day, recommend, MIN_NET_BENEFIT_EUR,
 )
 
 BRUSSELS = ZoneInfo("Europe/Brussels")
@@ -311,6 +313,76 @@ class TestFetchCurrentSoc:
         with patch.dict("os.environ", FUSIONSOLAR_ENV):
             with self._mock_urlopen([(LOGIN_RESPONSE, "tok"), (b"not-json", None)]):
                 result = fetch_current_soc()
+        assert result is None
+
+
+# ── fetch_solar_hourly ───────────────────────────────────────────────────────
+
+HOURLY_RESPONSE = json.dumps({
+    "result": {
+        "watt_hours_period": {
+            "2025-07-15 06:00:00": 500,
+            "2025-07-15 07:00:00": 1500,
+            "2025-07-15 08:00:00": 3000,
+            "2025-07-15 12:00:00": 5000,
+            "2025-07-16 06:00:00": 600,
+        }
+    }
+}).encode()
+
+
+class TestFetchSolarHourly:
+    def _mock_urlopen(self, payload=HOURLY_RESPONSE):
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = payload
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        return patch("urllib.request.urlopen", return_value=mock_resp)
+
+    def test_returns_hourly_kwh_for_date(self):
+        with patch.dict("os.environ", SOLAR_ENV):
+            with self._mock_urlopen():
+                result = fetch_solar_hourly("2025-07-15")
+        assert result == {6: pytest.approx(0.5), 7: pytest.approx(1.5),
+                          8: pytest.approx(3.0), 12: pytest.approx(5.0)}
+
+    def test_aggregates_subhour_periods(self):
+        payload = json.dumps({
+            "result": {
+                "watt_hours_period": {
+                    "2025-07-15 07:00:00": 200,
+                    "2025-07-15 07:15:00": 300,
+                    "2025-07-15 07:30:00": 400,
+                    "2025-07-15 07:45:00": 500,
+                }
+            }
+        }).encode()
+        with patch.dict("os.environ", SOLAR_ENV):
+            with self._mock_urlopen(payload):
+                result = fetch_solar_hourly("2025-07-15")
+        assert result == {7: pytest.approx(1.4)}
+
+    def test_returns_none_when_no_data_for_date(self):
+        with patch.dict("os.environ", SOLAR_ENV):
+            with self._mock_urlopen():
+                result = fetch_solar_hourly("2025-07-20")
+        assert result is None
+
+    def test_returns_none_when_env_vars_missing(self):
+        with patch.dict("os.environ", {}, clear=True):
+            result = fetch_solar_hourly("2025-07-15")
+        assert result is None
+
+    def test_returns_none_on_network_error(self):
+        with patch.dict("os.environ", SOLAR_ENV):
+            with patch("urllib.request.urlopen", side_effect=OSError("timeout")):
+                result = fetch_solar_hourly("2025-07-15")
+        assert result is None
+
+    def test_returns_none_on_malformed_response(self):
+        with patch.dict("os.environ", SOLAR_ENV):
+            with self._mock_urlopen(b"not-json"):
+                result = fetch_solar_hourly("2025-07-15")
         assert result is None
 
 
@@ -760,3 +832,160 @@ class TestPrepareEmail:
             _, subject, body = prepare_email()
         assert subject.startswith("NO_ACTION")
         assert "Hour (CET)" in body
+
+
+# ── simulate_day ─────────────────────────────────────────────────────────────
+
+class TestSimulateDay:
+    def _flat_prices(self, value, neg_hours=None, neg_value=-100.0):
+        prices = {h: value for h in range(24)}
+        for h in (neg_hours or []):
+            prices[h] = neg_value
+        return prices
+
+    def test_no_solar_no_feed(self):
+        prices = self._flat_prices(100.0, neg_hours=[12])
+        solar = {h: 0.0 for h in range(24)}
+        result = simulate_day(prices, solar, baseline_hourly_kwh=0.5, start_soc_pct=50.0)
+        assert result["total_feed_kwh"] == pytest.approx(0.0)
+        assert result["neg_feed_cost_eur"] == pytest.approx(0.0)
+
+    def test_full_battery_surplus_feeds(self):
+        # Battery at 90% (full), surplus 4 kWh at hour 12 (price -200).
+        # No baseline draw to keep battery at full until hour 12.
+        prices = self._flat_prices(50.0, neg_hours=[12], neg_value=-200.0)
+        solar = {12: 4.0}
+        result = simulate_day(prices, solar, baseline_hourly_kwh=0.0, start_soc_pct=90.0)
+        assert result["feeds_per_hour"][12] == pytest.approx(4.0)
+        assert result["neg_feed_cost_eur"] == pytest.approx(0.40)
+
+    def test_empty_battery_absorbs_surplus(self):
+        # Battery at 15% (min), surplus 3 kWh at hour 12, capped by MAX_CHARGE_RATE=5
+        # Battery has 11.25 kWh of room → absorbs all 3, no feed
+        prices = self._flat_prices(50.0, neg_hours=[12], neg_value=-200.0)
+        solar = {12: 3.5}
+        result = simulate_day(prices, solar, baseline_hourly_kwh=0.5, start_soc_pct=15.0)
+        assert result["feeds_per_hour"][12] == pytest.approx(0.0)
+        assert result["neg_feed_cost_eur"] == pytest.approx(0.0)
+
+    def test_charge_rate_caps_absorption(self):
+        # 10 kWh surplus in one hour, but battery can only absorb 5 → 5 feeds
+        prices = self._flat_prices(50.0, neg_hours=[12], neg_value=-200.0)
+        solar = {12: 10.5}
+        result = simulate_day(prices, solar, baseline_hourly_kwh=0.5, start_soc_pct=15.0)
+        assert result["feeds_per_hour"][12] == pytest.approx(5.0)
+        assert result["neg_feed_cost_eur"] == pytest.approx(5.0 * 200 * 0.5 / 1000)
+
+    def test_battery_fills_then_overflows(self):
+        # Battery at 80% (12 kWh), max 90% (13.5 kWh) → 1.5 kWh room
+        # Surplus 3 kWh/hr at hours 11+12. Hour 11: absorb 1.5, feed 1.5. Hour 12: feed 3.
+        prices = self._flat_prices(50.0, neg_hours=[11, 12], neg_value=-100.0)
+        solar = {11: 3.0, 12: 3.0}
+        result = simulate_day(prices, solar, baseline_hourly_kwh=0.0, start_soc_pct=80.0)
+        assert result["feeds_per_hour"][11] == pytest.approx(1.5)
+        assert result["feeds_per_hour"][12] == pytest.approx(3.0)
+
+    def test_phev_consumption_reduces_feed(self):
+        # 4 kWh surplus + 6 kWh PHEV draw → net -2 kWh need, no feed
+        prices = self._flat_prices(50.0, neg_hours=[12], neg_value=-200.0)
+        solar = {12: 4.5}
+        result = simulate_day(prices, solar, baseline_hourly_kwh=0.5,
+                              start_soc_pct=90.0, phev_hourly={12: 6.0})
+        assert result["feeds_per_hour"][12] == pytest.approx(0.0)
+
+    def test_force_discharge_creates_headroom(self):
+        # Battery 90%, surplus 4 kWh at hour 12 (price -200).
+        # Without force-discharge: feed 4 kWh → cost €0.40
+        # With force-discharge at 9: battery drops, has room to absorb hour-12 solar.
+        prices = self._flat_prices(80.0, neg_hours=[12], neg_value=-200.0)
+        solar = {12: 4.0}
+        baseline = simulate_day(prices, solar, baseline_hourly_kwh=0.0, start_soc_pct=90.0)
+        with_fd = simulate_day(prices, solar, baseline_hourly_kwh=0.0, start_soc_pct=90.0,
+                                force_discharge_hours={9})
+        assert with_fd["neg_feed_cost_eur"] < baseline["neg_feed_cost_eur"]
+
+    def test_pos_feed_revenue(self):
+        # Surplus 4 kWh at hour 12 (positive 80 €/MWh) → revenue 4 × 80 × 0.5 / 1000 = €0.16
+        prices = self._flat_prices(80.0)
+        solar = {12: 4.0}
+        result = simulate_day(prices, solar, baseline_hourly_kwh=0.0, start_soc_pct=90.0)
+        assert result["pos_feed_revenue_eur"] == pytest.approx(0.16)
+
+    def test_returns_required_keys(self):
+        prices = self._flat_prices(50.0)
+        solar = {h: 0.0 for h in range(24)}
+        result = simulate_day(prices, solar, baseline_hourly_kwh=0.5, start_soc_pct=50.0)
+        for key in ("feeds_per_hour", "total_feed_kwh", "neg_feed_kwh",
+                    "neg_feed_cost_eur", "pos_feed_revenue_eur", "end_soc_pct"):
+            assert key in result
+
+
+# ── recommend ────────────────────────────────────────────────────────────────
+
+class TestRecommend:
+    def _flat_prices(self, value, neg_hours=None, neg_value=-100.0):
+        prices = {h: value for h in range(24)}
+        for h in (neg_hours or []):
+            prices[h] = neg_value
+        return prices
+
+    def _no_solar(self):
+        return {h: 0.0 for h in range(24)}
+
+    def test_none_prices_returns_no_action(self):
+        result = recommend(None, self._no_solar(), 9.0, 50.0)
+        assert result["action"] == "NO_ACTION"
+
+    def test_none_solar_returns_no_action(self):
+        result = recommend(self._flat_prices(50.0), None, 9.0, 50.0)
+        assert result["action"] == "NO_ACTION"
+
+    def test_none_consumption_returns_no_action(self):
+        result = recommend(self._flat_prices(50.0), self._no_solar(), None, 50.0)
+        assert result["action"] == "NO_ACTION"
+
+    def test_none_soc_returns_no_action(self):
+        result = recommend(self._flat_prices(50.0), self._no_solar(), 9.0, None)
+        assert result["action"] == "NO_ACTION"
+
+    def test_no_negative_prices_returns_no_action(self):
+        result = recommend(self._flat_prices(100.0), self._no_solar(), 9.0, 50.0)
+        assert result["action"] == "NO_ACTION"
+
+    def test_may25_class_small_loss_returns_no_action(self):
+        # -12 €/MWh × ~4 kWh feed × 0.5 ≈ €0.024 — far below €5
+        prices = self._flat_prices(50.0, neg_hours=[12], neg_value=-12.0)
+        solar = {12: 4.5}
+        result = recommend(prices, solar, 0.5 * 24, 90.0)
+        assert result["action"] == "NO_ACTION"
+        assert result["baseline_cost_eur"] < MIN_NET_BENEFIT_EUR
+
+    def test_may1_class_big_loss_emits_recommendations(self):
+        # -500 €/MWh × 30 kWh = €7.50 baseline cost
+        prices = self._flat_prices(80.0, neg_hours=[10, 11, 12, 13, 14, 15], neg_value=-500.0)
+        solar = {h: 5.0 for h in (10, 11, 12, 13, 14, 15)}
+        result = recommend(prices, solar, baseline_consumption=0.0, current_soc=90.0)
+        assert result["action"] == "RECOMMEND"
+        assert result["baseline_cost_eur"] > MIN_NET_BENEFIT_EUR
+        assert len(result["recommendations"]) >= 1
+        assert result["combined_benefit_eur"] >= MIN_NET_BENEFIT_EUR
+
+    def test_recommendation_includes_phev_lever(self):
+        prices = self._flat_prices(80.0, neg_hours=[10, 11, 12, 13, 14, 15], neg_value=-500.0)
+        solar = {h: 5.0 for h in (10, 11, 12, 13, 14, 15)}
+        result = recommend(prices, solar, baseline_consumption=0.0, current_soc=90.0)
+        types = {r["type"] for r in result["recommendations"]}
+        assert "PHEV_PLUGIN" in types
+
+    def test_recommendation_includes_force_discharge(self):
+        prices = self._flat_prices(80.0, neg_hours=[10, 11, 12, 13, 14, 15], neg_value=-500.0)
+        solar = {h: 5.0 for h in (10, 11, 12, 13, 14, 15)}
+        result = recommend(prices, solar, baseline_consumption=0.0, current_soc=90.0)
+        types = {r["type"] for r in result["recommendations"]}
+        assert "FORCE_DISCHARGE" in types
+
+    def test_returns_required_keys(self):
+        result = recommend(self._flat_prices(50.0), self._no_solar(), 9.0, 50.0)
+        for key in ("action", "baseline_cost_eur", "negative_hours",
+                    "recommendations", "combined_benefit_eur"):
+            assert key in result

@@ -170,9 +170,164 @@ BATTERY_CAPACITY_KWH = 15
 MAX_CHARGE_RATE_KW = 5
 MIN_SOC_PCT = 15
 TARGET_CHARGE_SOC_PCT = 90
+MAX_SOC_PCT = 90
 MIN_SAVING_EUR = 1.00
+INJECTION_RATE = 0.5
+PHEV_CHARGE_RATE_KW = 6
+PHEV_FULL_CHARGE_KWH = 18
+MIN_NET_BENEFIT_EUR = 5.00
 
 _OVERNIGHT_HOURS = set(range(8)) | {22, 23}
+
+
+def simulate_day(prices_hourly, solar_hourly, baseline_hourly_kwh, start_soc_pct,
+                 phev_hourly=None, force_discharge_hours=None):
+    phev_hourly = phev_hourly or {}
+    force_discharge_hours = force_discharge_hours or set()
+
+    current_kwh = (start_soc_pct / 100.0) * BATTERY_CAPACITY_KWH
+    max_kwh = (MAX_SOC_PCT / 100.0) * BATTERY_CAPACITY_KWH
+    min_kwh = (MIN_SOC_PCT / 100.0) * BATTERY_CAPACITY_KWH
+
+    feeds_per_hour = {}
+    total_feed = 0.0
+    neg_feed_kwh = 0.0
+    neg_feed_cost = 0.0
+    pos_feed_revenue = 0.0
+
+    for h in sorted(prices_hourly.keys()):
+        solar = solar_hourly.get(h, 0.0)
+        cons = baseline_hourly_kwh + phev_hourly.get(h, 0.0)
+        price = prices_hourly[h]
+
+        if h in force_discharge_hours:
+            available = max(0.0, current_kwh - min_kwh)
+            battery_out = min(MAX_CHARGE_RATE_KW, available)
+            current_kwh -= battery_out
+            feed = max(0.0, solar + battery_out - cons)
+        else:
+            net = solar - cons
+            if net > 0:
+                room = max(0.0, max_kwh - current_kwh)
+                absorbed = min(net, MAX_CHARGE_RATE_KW, room)
+                current_kwh += absorbed
+                feed = net - absorbed
+            else:
+                need = -net
+                available = max(0.0, current_kwh - min_kwh)
+                drawn = min(need, MAX_CHARGE_RATE_KW, available)
+                current_kwh -= drawn
+                feed = 0.0
+
+        feeds_per_hour[h] = feed
+        total_feed += feed
+        if price < 0:
+            neg_feed_kwh += feed
+            neg_feed_cost += feed * abs(price) * INJECTION_RATE / 1000.0
+        else:
+            pos_feed_revenue += feed * price * INJECTION_RATE / 1000.0
+
+    return {
+        "feeds_per_hour": feeds_per_hour,
+        "total_feed_kwh": total_feed,
+        "neg_feed_kwh": neg_feed_kwh,
+        "neg_feed_cost_eur": neg_feed_cost,
+        "pos_feed_revenue_eur": pos_feed_revenue,
+        "end_soc_pct": current_kwh / BATTERY_CAPACITY_KWH * 100.0,
+    }
+
+
+def recommend(prices_hourly, solar_hourly, baseline_consumption, current_soc):
+    no_action = {
+        "action": "NO_ACTION",
+        "baseline_cost_eur": 0.0,
+        "negative_hours": [],
+        "recommendations": [],
+        "combined_benefit_eur": 0.0,
+        "rationale": "",
+    }
+
+    if prices_hourly is None or solar_hourly is None or baseline_consumption is None or current_soc is None:
+        return {**no_action, "rationale": "Insufficient data."}
+
+    neg_hours = sorted(h for h, p in prices_hourly.items() if p < 0)
+    if not neg_hours:
+        return {**no_action, "rationale": "No negative prices forecast."}
+
+    baseline_hourly = baseline_consumption / 24.0
+
+    baseline = simulate_day(prices_hourly, solar_hourly, baseline_hourly, current_soc)
+    baseline_cost = baseline["neg_feed_cost_eur"]
+    baseline_net = baseline["neg_feed_cost_eur"] - baseline["pos_feed_revenue_eur"]
+
+    if baseline_cost < MIN_NET_BENEFIT_EUR:
+        return {**no_action,
+                "baseline_cost_eur": baseline_cost,
+                "negative_hours": neg_hours,
+                "rationale": f"Expected feed cost €{baseline_cost:.2f} below €{MIN_NET_BENEFIT_EUR:.0f} threshold."}
+
+    discharge_kwh = max(0.0, (current_soc - MIN_SOC_PCT) / 100.0 * BATTERY_CAPACITY_KWH)
+    discharge_duration_h = math.ceil(discharge_kwh / MAX_CHARGE_RATE_KW) if discharge_kwh > 0 else 0
+    neg_start = neg_hours[0]
+    fd_hours = {h for h in (neg_start - i for i in range(1, discharge_duration_h + 1)) if 0 <= h < 24}
+
+    sim_pd = simulate_day(prices_hourly, solar_hourly, baseline_hourly, current_soc,
+                          force_discharge_hours=fd_hours)
+    pd_net = sim_pd["neg_feed_cost_eur"] - sim_pd["pos_feed_revenue_eur"]
+    pd_benefit = baseline_net - pd_net
+
+    phev_hourly = {}
+    remaining = PHEV_FULL_CHARGE_KWH
+    for h in neg_hours:
+        if remaining <= 0:
+            break
+        draw = min(PHEV_CHARGE_RATE_KW, remaining)
+        phev_hourly[h] = draw
+        remaining -= draw
+
+    sim_phev = simulate_day(prices_hourly, solar_hourly, baseline_hourly, current_soc,
+                            phev_hourly=phev_hourly)
+    phev_net = sim_phev["neg_feed_cost_eur"] - sim_phev["pos_feed_revenue_eur"]
+    phev_benefit = baseline_net - phev_net
+
+    sim_both = simulate_day(prices_hourly, solar_hourly, baseline_hourly, current_soc,
+                            phev_hourly=phev_hourly, force_discharge_hours=fd_hours)
+    both_net = sim_both["neg_feed_cost_eur"] - sim_both["pos_feed_revenue_eur"]
+    combined_benefit = baseline_net - both_net
+
+    if combined_benefit < MIN_NET_BENEFIT_EUR:
+        return {**no_action,
+                "baseline_cost_eur": baseline_cost,
+                "negative_hours": neg_hours,
+                "rationale": f"No action combination clears €{MIN_NET_BENEFIT_EUR:.0f} benefit threshold."}
+
+    recommendations = []
+    if fd_hours and pd_benefit > 0:
+        recommendations.append({
+            "type": "FORCE_DISCHARGE",
+            "start_hour": min(fd_hours),
+            "end_hour": max(fd_hours) + 1,
+            "target_soc_pct": MIN_SOC_PCT,
+            "kwh": discharge_kwh,
+            "benefit_eur": pd_benefit,
+        })
+    if phev_hourly and phev_benefit > 0:
+        recommendations.append({
+            "type": "PHEV_PLUGIN",
+            "start_hour": min(phev_hourly.keys()),
+            "end_hour": max(phev_hourly.keys()) + 1,
+            "kwh": sum(phev_hourly.values()),
+            "benefit_eur": phev_benefit,
+        })
+
+    return {
+        "action": "RECOMMEND",
+        "baseline_cost_eur": baseline_cost,
+        "negative_hours": neg_hours,
+        "recommendations": recommendations,
+        "combined_benefit_eur": combined_benefit,
+        "rationale": "",
+    }
 
 
 def classify_scenario(forecast_kwh, current_soc, avg_consumption):
@@ -313,6 +468,37 @@ def format_recommendation(action_result, scenario, forecast_kwh, soc, avg_consum
     lines.append(f"Avg consumption (7d): {consumption_str}")
     lines.append("-------------------------------")
     return "\n".join(lines)
+
+
+def fetch_solar_hourly(date_str):
+    key = os.getenv("FORECAST_SOLAR_API_KEY")
+    lat = os.getenv("SOLAR_LAT")
+    lon = os.getenv("SOLAR_LON")
+    dec = os.getenv("SOLAR_DECLINATION")
+    az  = os.getenv("SOLAR_AZIMUTH")
+    kwp = os.getenv("SOLAR_KWP")
+    if not all([key, lat, lon, dec, az, kwp]):
+        return None
+    url = FORECAST_SOLAR_URL.format(key=key, lat=lat, lon=lon, dec=dec, az=az, kwp=kwp)
+    try:
+        req = urllib.request.Request(url, headers=HEADERS)
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            data = json.loads(resp.read())
+        period = data["result"]["watt_hours_period"]
+        hourly_wh = defaultdict(float)
+        for ts_str, wh in period.items():
+            if not ts_str.startswith(date_str):
+                continue
+            try:
+                hour = int(ts_str[11:13])
+            except (ValueError, IndexError):
+                continue
+            hourly_wh[hour] += wh
+        if not hourly_wh:
+            return None
+        return {h: wh / 1000 for h, wh in hourly_wh.items()}
+    except Exception:
+        return None
 
 
 def fetch_solar_forecast(date_str):
