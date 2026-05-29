@@ -169,15 +169,11 @@ def fetch_median_daily_consumption(days=7):
 BATTERY_CAPACITY_KWH = 15
 MAX_CHARGE_RATE_KW = 5
 MIN_SOC_PCT = 15
-TARGET_CHARGE_SOC_PCT = 90
 MAX_SOC_PCT = 90
-MIN_SAVING_EUR = 1.00
 INJECTION_RATE = 0.5
 PHEV_CHARGE_RATE_KW = 6
 PHEV_FULL_CHARGE_KWH = 18
 MIN_NET_BENEFIT_EUR = 5.00
-
-_OVERNIGHT_HOURS = set(range(8)) | {22, 23}
 
 
 def simulate_day(prices_hourly, solar_hourly, baseline_hourly_kwh, start_soc_pct,
@@ -242,6 +238,7 @@ def recommend(prices_hourly, solar_hourly, baseline_consumption, current_soc):
         "action": "NO_ACTION",
         "baseline_cost_eur": 0.0,
         "negative_hours": [],
+        "avg_negative_price_eur_per_mwh": 0.0,
         "recommendations": [],
         "combined_benefit_eur": 0.0,
         "rationale": "",
@@ -254,6 +251,8 @@ def recommend(prices_hourly, solar_hourly, baseline_consumption, current_soc):
     if not neg_hours:
         return {**no_action, "rationale": "No negative prices forecast."}
 
+    avg_neg_price = sum(prices_hourly[h] for h in neg_hours) / len(neg_hours)
+
     baseline_hourly = baseline_consumption / 24.0
 
     baseline = simulate_day(prices_hourly, solar_hourly, baseline_hourly, current_soc)
@@ -264,6 +263,7 @@ def recommend(prices_hourly, solar_hourly, baseline_consumption, current_soc):
         return {**no_action,
                 "baseline_cost_eur": baseline_cost,
                 "negative_hours": neg_hours,
+                "avg_negative_price_eur_per_mwh": avg_neg_price,
                 "rationale": f"Expected feed cost €{baseline_cost:.2f} below €{MIN_NET_BENEFIT_EUR:.0f} threshold."}
 
     discharge_kwh = max(0.0, (current_soc - MIN_SOC_PCT) / 100.0 * BATTERY_CAPACITY_KWH)
@@ -299,6 +299,7 @@ def recommend(prices_hourly, solar_hourly, baseline_consumption, current_soc):
         return {**no_action,
                 "baseline_cost_eur": baseline_cost,
                 "negative_hours": neg_hours,
+                "avg_negative_price_eur_per_mwh": avg_neg_price,
                 "rationale": f"No action combination clears €{MIN_NET_BENEFIT_EUR:.0f} benefit threshold."}
 
     recommendations = []
@@ -324,148 +325,54 @@ def recommend(prices_hourly, solar_hourly, baseline_consumption, current_soc):
         "action": "RECOMMEND",
         "baseline_cost_eur": baseline_cost,
         "negative_hours": neg_hours,
+        "avg_negative_price_eur_per_mwh": avg_neg_price,
         "recommendations": recommendations,
         "combined_benefit_eur": combined_benefit,
         "rationale": "",
     }
 
 
-def classify_scenario(forecast_kwh, current_soc, avg_consumption):
-    current_stored = (current_soc / 100) * BATTERY_CAPACITY_KWH
-    solar_surplus = max(0.0, forecast_kwh - avg_consumption)
-    if current_stored + solar_surplus > BATTERY_CAPACITY_KWH:
-        return "EXCESS"
-    if current_stored + forecast_kwh < avg_consumption:
-        return "DEFICIT"
-    return "BALANCED"
-
-
-def find_negative_price_window(prices):
-    block_start = None
-    last_h = None
-    for h, p in prices:
-        if p < 0:
-            if block_start is None:
-                block_start = h
-        else:
-            if block_start is not None:
-                return (block_start, h)
-        last_h = h
-    if block_start is not None:
-        return (block_start, last_h + timedelta(hours=1))
-    return None
-
-
-def find_cheapest_overnight_window(prices, charge_kwh):
-    overnight = [(h, p) for h, p in prices if h.hour in _OVERNIGHT_HOURS]
-    late = [(h, p) for h, p in overnight if h.hour >= 22]
-    early = [(h, p) for h, p in overnight if h.hour < 8]
-    ordered = late + early
-
-    window_size = max(1, math.ceil(charge_kwh / MAX_CHARGE_RATE_KW))
-    best_idx = 0
-    best_avg = float("inf")
-    for i in range(len(ordered) - window_size + 1):
-        avg = sum(p for _, p in ordered[i:i + window_size]) / window_size
-        if avg < best_avg:
-            best_avg = avg
-            best_idx = i
-
-    start = ordered[best_idx][0]
-    return (start, start + timedelta(hours=window_size))
-
-
-def recommend_action(scenario, prices, current_soc, forecast_kwh):
-    _no_action = {
-        "action": "NO_ACTION",
-        "start_time": None,
-        "end_time": None,
-        "target_soc": None,
-        "rationale": "No action required.",
-        "estimated_saving": 0.0,
-    }
-
-    if prices is None or current_soc is None or forecast_kwh is None:
-        return {**_no_action, "rationale": "Insufficient data."}
-
-    if scenario == "EXCESS":
-        neg = find_negative_price_window(prices)
-        if neg:
-            discharge_kwh = (current_soc / 100 - MIN_SOC_PCT / 100) * BATTERY_CAPACITY_KWH
-            duration_h = discharge_kwh / MAX_CHARGE_RATE_KW
-            start_time = neg[0] - timedelta(hours=duration_h)
-            return {
-                "action": "FORCE_DISCHARGE",
-                "start_time": start_time,
-                "end_time": neg[1],
-                "target_soc": MIN_SOC_PCT,
-                "rationale": (
-                    f"Battery overflow likely. Discharge {discharge_kwh:.1f} kWh "
-                    f"before negative price window at {neg[0].strftime('%H:%M')}."
-                ),
-                "estimated_saving": 0.0,
-            }
-        return {**_no_action, "action": "MONITOR", "rationale": "Battery likely to overflow; no negative prices detected."}
-
-    if scenario == "DEFICIT":
-        charge_kwh = (TARGET_CHARGE_SOC_PCT / 100 - current_soc / 100) * BATTERY_CAPACITY_KWH
-        if charge_kwh <= 0:
-            return _no_action
-
-        win_start, win_end = find_cheapest_overnight_window(prices, charge_kwh)
-
-        price_by_hour = {h.hour: p for h, p in prices}
-        win_prices = []
-        h = win_start
-        while h < win_end:
-            if h.hour in price_by_hour:
-                win_prices.append(price_by_hour[h.hour])
-            h += timedelta(hours=1)
-        avg_win = sum(win_prices) / len(win_prices) if win_prices else 0.0
-
-        daytime = [p for h, p in prices if h.hour not in _OVERNIGHT_HOURS]
-        avg_day = sum(daytime) / len(daytime) if daytime else 0.0
-
-        saving = round(charge_kwh * (avg_day - avg_win) / 1000, 2)
-        if saving > MIN_SAVING_EUR:
-            return {
-                "action": "FORCE_CHARGE",
-                "start_time": win_start,
-                "end_time": win_end,
-                "target_soc": TARGET_CHARGE_SOC_PCT,
-                "rationale": (
-                    f"Deficit scenario. Charge {charge_kwh:.1f} kWh overnight "
-                    f"({win_start.strftime('%H:%M')}–{win_end.strftime('%H:%M')}). "
-                    f"Window avg {avg_win:.0f} vs daytime avg {avg_day:.0f} €/MWh."
-                ),
-                "estimated_saving": saving,
-            }
-
-    return _no_action
-
-
-def format_recommendation(action_result, scenario, forecast_kwh, soc, avg_consumption):
-    action = action_result["action"]
+def format_recommendation(result, soc, baseline_consumption, solar_forecast_kwh):
     lines = ["--- Charging recommendation ---"]
-    if scenario is not None:
-        lines.append(f"Scenario:  {scenario}")
-    lines.append(f"Action:    {action}")
-    if action_result["start_time"] is not None:
-        start = action_result["start_time"].strftime("%H:%M")
-        end = action_result["end_time"].strftime("%H:%M")
-        lines.append(f"Window:    {start}–{end} CET")
-    if action_result["target_soc"] is not None:
-        lines.append(f"Target:    {action_result['target_soc']}% SOC")
-    if action_result["estimated_saving"] > 0:
-        lines.append(f"Saving:    ~€{action_result['estimated_saving']:.2f}")
-    lines.append(f"Rationale: {action_result['rationale']}")
+
+    if result["action"] == "RECOMMEND":
+        neg = result["negative_hours"]
+        if neg:
+            start = f"{min(neg):02d}:00"
+            end = f"{max(neg) + 1:02d}:00"
+            avg = result.get("avg_negative_price_eur_per_mwh", 0.0)
+            lines.append(f"Negative-price window: {start}–{end} CET (avg {avg:.0f} €/MWh)")
+        lines.append(f"Expected loss without action: €{result['baseline_cost_eur']:.2f}")
+        lines.append("")
+        lines.append("Recommended:")
+        for rec in result["recommendations"]:
+            if rec["type"] == "PHEV_PLUGIN":
+                lines.append(
+                    f"  • Plug in PHEV at {rec['start_hour']:02d}:00 "
+                    f"(absorbs ~{rec['kwh']:.0f} kWh, saves ~€{rec['benefit_eur']:.2f})"
+                )
+            elif rec["type"] == "FORCE_DISCHARGE":
+                lines.append(
+                    f"  • Force-discharge battery at {rec['start_hour']:02d}:00, "
+                    f"target SOC {rec['target_soc_pct']}%"
+                )
+                lines.append(
+                    f"    (frees ~{rec['kwh']:.0f} kWh capacity, saves ~€{rec['benefit_eur']:.2f})"
+                )
+        lines.append(f"Total expected benefit: ~€{result['combined_benefit_eur']:.2f}")
+    else:
+        rationale = result.get("rationale") or "No action needed."
+        lines.append(rationale)
+        if result.get("baseline_cost_eur", 0) > 0:
+            lines.append(f"Expected feed cost: €{result['baseline_cost_eur']:.2f}")
+
     lines.append("")
-    forecast_str = f"{forecast_kwh:.1f} kWh" if forecast_kwh is not None else "unavailable"
+    forecast_str = f"{solar_forecast_kwh:.1f} kWh" if solar_forecast_kwh is not None else "unavailable"
     soc_str = f"{soc:.0f}%" if soc is not None else "unavailable"
-    consumption_str = f"{avg_consumption:.1f} kWh/day" if avg_consumption is not None else "unavailable"
-    lines.append(f"Solar forecast:       {forecast_str}")
-    lines.append(f"Battery SOC now:      {soc_str}")
-    lines.append(f"Avg consumption (7d): {consumption_str}")
+    cons_str = f"{baseline_consumption:.1f} kWh/day" if baseline_consumption is not None else "unavailable"
+    lines.append(f"Solar forecast:        {forecast_str}")
+    lines.append(f"Battery SOC now:       {soc_str}")
+    lines.append(f"Typical daily use (7d): {cons_str}")
     lines.append("-------------------------------")
     return "\n".join(lines)
 
@@ -625,19 +532,18 @@ def prepare_email():
 
     hourly = parse_entries(fetch_prices(target_date))
     marked = mark_cheapest(hourly)
-    forecast_kwh = fetch_solar_forecast(target_date)
+
+    prices_hourly = {h.hour: p for h, p in hourly}
+    solar_hourly = fetch_solar_hourly(target_date)
+    daily_solar = sum(solar_hourly.values()) if solar_hourly else None
+
     fusionsolar = _fetch_fusionsolar_data()
     soc = fusionsolar["soc"]
     median_consumption = fusionsolar["median_consumption"]
 
-    if forecast_kwh is not None and soc is not None and median_consumption is not None:
-        scenario = classify_scenario(forecast_kwh, soc, median_consumption)
-    else:
-        scenario = None
-
-    action_result = recommend_action(scenario, hourly, soc, forecast_kwh)
-    action = action_result["action"]
-    rec_block = format_recommendation(action_result, scenario, forecast_kwh, soc, median_consumption)
+    result = recommend(prices_hourly, solar_hourly, median_consumption, soc)
+    action = result["action"]
+    rec_block = format_recommendation(result, soc, median_consumption, daily_solar)
 
     subject = f"{action} — Nordpool prices for {target_date}"
     body = explanatory_text() + rec_block + "\n\n" + summarize_hours(marked) + "\n" + format_table(marked)

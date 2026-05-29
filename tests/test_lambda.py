@@ -10,8 +10,6 @@ from lambda_function import (
     fetch_solar_forecast, fetch_solar_hourly,
     fetch_current_soc, fetch_median_daily_consumption,
     _fetch_fusionsolar_data,
-    classify_scenario, find_negative_price_window,
-    find_cheapest_overnight_window, recommend_action,
     format_recommendation, prepare_email,
     simulate_day, recommend, MIN_NET_BENEFIT_EUR,
 )
@@ -514,273 +512,115 @@ class TestFetchFusionsolarData:
         assert result["median_consumption"] == pytest.approx(20.0)
 
 
-# ── M4 helpers ───────────────────────────────────────────────────────────────
-
-def _make_prices(hour_to_price, base_date=None):
-    base = base_date or datetime(2025, 1, 15, tzinfo=BRUSSELS)
-    if isinstance(hour_to_price, dict):
-        return [(base.replace(hour=h), hour_to_price.get(h, 100.0)) for h in range(24)]
-    return [(base.replace(hour=h), p) for h, p in enumerate(hour_to_price)]
-
-
-# ── classify_scenario ────────────────────────────────────────────────────────
-
-class TestClassifyScenario:
-    def test_excess(self):
-        # stored=13.5, surplus=15, total=28.5 > 15
-        assert classify_scenario(forecast_kwh=20.0, current_soc=90.0, avg_consumption=5.0) == "EXCESS"
-
-    def test_deficit(self):
-        # stored=1.5, stored+forecast=6.5 < 20
-        assert classify_scenario(forecast_kwh=5.0, current_soc=10.0, avg_consumption=20.0) == "DEFICIT"
-
-    def test_balanced(self):
-        # stored=7.5, surplus=0; 7.5+15 >= 15 and 7.5 <= 15
-        assert classify_scenario(forecast_kwh=15.0, current_soc=50.0, avg_consumption=15.0) == "BALANCED"
-
-    def test_excess_boundary_is_balanced(self):
-        # stored=15 (soc=100%), surplus=0 (forecast<=consumption), total=15 → not > 15
-        assert classify_scenario(forecast_kwh=10.0, current_soc=100.0, avg_consumption=15.0) == "BALANCED"
-
-    def test_just_above_excess_boundary(self):
-        # stored=15, surplus=1, total=16 > 15 → EXCESS
-        assert classify_scenario(forecast_kwh=16.0, current_soc=100.0, avg_consumption=15.0) == "EXCESS"
-
-    def test_deficit_boundary_is_balanced(self):
-        # stored=0, forecast=10, consumption=10 → 0+10 = 10, not < 10
-        assert classify_scenario(forecast_kwh=10.0, current_soc=0.0, avg_consumption=10.0) == "BALANCED"
-
-    def test_just_below_deficit_boundary(self):
-        # stored=0, forecast=9.9, consumption=10 → 9.9 < 10 → DEFICIT
-        assert classify_scenario(forecast_kwh=9.9, current_soc=0.0, avg_consumption=10.0) == "DEFICIT"
-
-
-# ── find_negative_price_window ───────────────────────────────────────────────
-
-class TestFindNegativePriceWindow:
-    def test_no_negatives_returns_none(self):
-        prices = _make_prices([10.0] * 24)
-        assert find_negative_price_window(prices) is None
-
-    def test_zero_prices_returns_none(self):
-        prices = _make_prices([0.0] * 24)
-        assert find_negative_price_window(prices) is None
-
-    def test_single_negative_hour(self):
-        vals = [10.0] * 24
-        vals[14] = -5.0
-        prices = _make_prices(vals)
-        start, end = find_negative_price_window(prices)
-        assert start.hour == 14
-        assert end == start + timedelta(hours=1)
-
-    def test_contiguous_negative_block(self):
-        vals = [10.0] * 24
-        vals[13] = -10.0
-        vals[14] = -20.0
-        vals[15] = -5.0
-        prices = _make_prices(vals)
-        start, end = find_negative_price_window(prices)
-        assert start.hour == 13
-        assert end.hour == 16
-
-    def test_returns_first_of_multiple_blocks(self):
-        vals = [10.0] * 24
-        vals[5] = -1.0
-        vals[15] = -2.0
-        vals[16] = -3.0
-        prices = _make_prices(vals)
-        start, end = find_negative_price_window(prices)
-        assert start.hour == 5
-
-
-# ── find_cheapest_overnight_window ───────────────────────────────────────────
-
-class TestFindCheapestOvernightWindow:
-    def test_single_hour_window(self):
-        # charge_kwh=5 → window_size=1 (ceil(5/5)=1)
-        vals = {h: 50.0 for h in range(24)}
-        vals[3] = 10.0
-        prices = _make_prices(vals)
-        start, end = find_cheapest_overnight_window(prices, charge_kwh=5.0)
-        assert start.hour == 3
-        assert end == start + timedelta(hours=1)
-
-    def test_two_hour_window(self):
-        # charge_kwh=8 → window_size=2 (ceil(8/5)=2)
-        vals = {h: 50.0 for h in range(24)}
-        vals[2] = 10.0
-        vals[3] = 11.0
-        prices = _make_prices(vals)
-        start, end = find_cheapest_overnight_window(prices, charge_kwh=8.0)
-        assert start.hour == 2
-        assert end.hour == 4
-
-    def test_only_overnight_hours(self):
-        # Daytime hour 10 is very cheap — result must still be an overnight hour
-        vals = {h: 100.0 for h in range(24)}
-        for h in list(range(8)) + [22, 23]:
-            vals[h] = 50.0
-        vals[10] = 1.0
-        prices = _make_prices(vals)
-        start, end = find_cheapest_overnight_window(prices, charge_kwh=5.0)
-        assert start.hour in set(range(8)) | {22, 23}
-
-
-# ── recommend_action ─────────────────────────────────────────────────────────
-
-class TestRecommendAction:
-    def _flat(self, price=100.0):
-        return _make_prices([price] * 24)
-
-    def _cheap_overnight(self):
-        # Overnight (00-07, 22-23): 20 €/MWh; daytime (08-21): 200 €/MWh
-        vals = {h: 200.0 for h in range(24)}
-        for h in list(range(8)) + [22, 23]:
-            vals[h] = 20.0
-        return _make_prices(vals)
-
-    def _with_negative_midday(self):
-        vals = [100.0] * 24
-        vals[14] = -20.0
-        vals[15] = -10.0
-        return _make_prices(vals)
-
-    def test_none_forecast_gives_no_action(self):
-        assert recommend_action("BALANCED", self._flat(), 50.0, None)["action"] == "NO_ACTION"
-
-    def test_none_soc_gives_no_action(self):
-        assert recommend_action("BALANCED", self._flat(), None, 15.0)["action"] == "NO_ACTION"
-
-    def test_none_prices_gives_no_action(self):
-        assert recommend_action("BALANCED", None, 50.0, 15.0)["action"] == "NO_ACTION"
-
-    def test_result_has_required_keys(self):
-        result = recommend_action("BALANCED", self._flat(), 50.0, 15.0)
-        assert {"action", "start_time", "end_time", "target_soc", "rationale", "estimated_saving"} <= result.keys()
-
-    def test_balanced_returns_no_action(self):
-        assert recommend_action("BALANCED", self._flat(), 50.0, 15.0)["action"] == "NO_ACTION"
-
-    def test_excess_with_negative_prices_returns_force_discharge(self):
-        result = recommend_action("EXCESS", self._with_negative_midday(), 80.0, 20.0)
-        assert result["action"] == "FORCE_DISCHARGE"
-
-    def test_force_discharge_has_start_and_end(self):
-        result = recommend_action("EXCESS", self._with_negative_midday(), 80.0, 20.0)
-        assert result["start_time"] is not None
-        assert result["end_time"] is not None
-
-    def test_excess_no_negative_prices_returns_monitor(self):
-        result = recommend_action("EXCESS", self._flat(), 80.0, 20.0)
-        assert result["action"] == "MONITOR"
-
-    def test_deficit_with_sufficient_saving_returns_force_charge(self):
-        # soc=10%, charge_kwh=(0.9-0.1)*15=12 kWh
-        # saving = 12 * (200-20)/1000 = 2.16 > 1.00
-        result = recommend_action("DEFICIT", self._cheap_overnight(), 10.0, 5.0)
-        assert result["action"] == "FORCE_CHARGE"
-        assert result["estimated_saving"] > 1.00
-
-    def test_force_charge_target_soc_is_90(self):
-        result = recommend_action("DEFICIT", self._cheap_overnight(), 10.0, 5.0)
-        assert result["target_soc"] == 90
-
-    def test_deficit_flat_prices_returns_no_action(self):
-        # No price differential → saving = 0 ≤ 1.00
-        result = recommend_action("DEFICIT", self._flat(), 10.0, 5.0)
-        assert result["action"] == "NO_ACTION"
-
-    def test_rationale_is_nonempty_string(self):
-        result = recommend_action("DEFICIT", self._cheap_overnight(), 10.0, 5.0)
-        assert isinstance(result["rationale"], str) and len(result["rationale"]) > 0
-
-
 # ── format_recommendation ────────────────────────────────────────────────────
 
 class TestFormatRecommendation:
-    def _force_charge_result(self):
-        base = datetime(2025, 1, 15, tzinfo=BRUSSELS)
+    def _recommend_result(self):
         return {
-            "action": "FORCE_CHARGE",
-            "start_time": base.replace(hour=1),
-            "end_time": base.replace(hour=4),
-            "target_soc": 90,
-            "rationale": "Deficit scenario. Charge 12.0 kWh overnight.",
-            "estimated_saving": 1.40,
+            "action": "RECOMMEND",
+            "baseline_cost_eur": 7.20,
+            "negative_hours": [11, 12, 13, 14],
+            "avg_negative_price_eur_per_mwh": -180.0,
+            "recommendations": [
+                {
+                    "type": "PHEV_PLUGIN",
+                    "start_hour": 11,
+                    "end_hour": 14,
+                    "kwh": 18.0,
+                    "benefit_eur": 4.0,
+                },
+                {
+                    "type": "FORCE_DISCHARGE",
+                    "start_hour": 9,
+                    "end_hour": 11,
+                    "target_soc_pct": 15,
+                    "kwh": 11.25,
+                    "benefit_eur": 2.0,
+                },
+            ],
+            "combined_benefit_eur": 6.0,
+            "rationale": "",
         }
 
-    def _no_action_result(self):
+    def _no_action_result(self, baseline_cost=0.40, rationale="No action needed."):
         return {
             "action": "NO_ACTION",
-            "start_time": None,
-            "end_time": None,
-            "target_soc": None,
-            "rationale": "No action required.",
-            "estimated_saving": 0.0,
+            "baseline_cost_eur": baseline_cost,
+            "negative_hours": [12],
+            "avg_negative_price_eur_per_mwh": -12.0,
+            "recommendations": [],
+            "combined_benefit_eur": 0.0,
+            "rationale": rationale,
         }
 
     def test_contains_header_and_footer(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
+        text = format_recommendation(self._recommend_result(), soc=32.0,
+                                     baseline_consumption=9.0, solar_forecast_kwh=18.5)
         assert "--- Charging recommendation ---" in text
         assert "-------------------------------" in text
 
-    def test_contains_scenario_and_action(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
-        assert "DEFICIT" in text
-        assert "FORCE_CHARGE" in text
+    def test_recommend_shows_window_and_loss(self):
+        text = format_recommendation(self._recommend_result(), soc=32.0,
+                                     baseline_consumption=9.0, solar_forecast_kwh=18.5)
+        assert "11:00" in text
+        assert "15:00" in text  # end_hour 14 + 1 = 15
+        assert "7.20" in text
 
-    def test_contains_window(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
-        assert "01:00" in text
-        assert "04:00" in text
+    def test_recommend_lists_both_levers(self):
+        text = format_recommendation(self._recommend_result(), soc=32.0,
+                                     baseline_consumption=9.0, solar_forecast_kwh=18.5)
+        assert "PHEV" in text
+        assert "Force-discharge" in text or "FORCE_DISCHARGE" in text
 
-    def test_contains_target_soc(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
-        assert "90%" in text
+    def test_recommend_shows_per_lever_benefit(self):
+        text = format_recommendation(self._recommend_result(), soc=32.0,
+                                     baseline_consumption=9.0, solar_forecast_kwh=18.5)
+        assert "4.00" in text
+        assert "2.00" in text
 
-    def test_contains_saving(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
-        assert "1.40" in text
+    def test_recommend_shows_combined_benefit(self):
+        text = format_recommendation(self._recommend_result(), soc=32.0,
+                                     baseline_consumption=9.0, solar_forecast_kwh=18.5)
+        assert "6.00" in text
+
+    def test_no_action_shows_baseline_cost(self):
+        text = format_recommendation(self._no_action_result(baseline_cost=0.40),
+                                     soc=32.0, baseline_consumption=9.0,
+                                     solar_forecast_kwh=18.5)
+        assert "0.40" in text
+        assert "No action" in text or "NO_ACTION" in text
+
+    def test_no_action_no_lever_lines(self):
+        text = format_recommendation(self._no_action_result(),
+                                     soc=32.0, baseline_consumption=9.0,
+                                     solar_forecast_kwh=18.5)
+        assert "PHEV" not in text
+        assert "Force-discharge" not in text
 
     def test_contains_data_lines(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
-        assert "12.5 kWh" in text
+        text = format_recommendation(self._recommend_result(), soc=32.0,
+                                     baseline_consumption=9.0, solar_forecast_kwh=18.5)
+        assert "18.5 kWh" in text
         assert "32%" in text
-        assert "20.3 kWh" in text
+        assert "9.0 kWh" in text
 
-    def test_none_forecast_shows_unavailable(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", None, 32.0, 20.3)
+    def test_none_data_shows_unavailable(self):
+        text = format_recommendation(self._no_action_result(), soc=None,
+                                     baseline_consumption=None, solar_forecast_kwh=None)
         assert "unavailable" in text
-
-    def test_none_soc_shows_unavailable(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, None, 20.3)
-        assert "unavailable" in text
-
-    def test_none_consumption_shows_unavailable(self):
-        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, None)
-        assert "unavailable" in text
-
-    def test_no_action_no_window_lines(self):
-        text = format_recommendation(self._no_action_result(), None, None, None, None)
-        assert "NO_ACTION" in text
-        assert "Window:" not in text
-        assert "Target:" not in text
-
-    def test_no_action_no_scenario_line_when_none(self):
-        text = format_recommendation(self._no_action_result(), None, None, None, None)
-        assert "Scenario:" not in text
 
 
 # ── prepare_email ────────────────────────────────────────────────────────────
 
 class TestPrepareEmail:
-    def _patch_all(self, fixture, forecast=12.5, soc=32.0, avg_consumption=20.3):
+    def _patch_all(self, fixture, solar_hourly=None, soc=32.0, median_cons=9.0):
+        if solar_hourly is None and solar_hourly != {}:
+            solar_hourly = {h: 0.0 for h in range(24)}
         return (
             patch("lambda_function.fetch_prices", return_value=fixture),
-            patch("lambda_function.fetch_solar_forecast", return_value=forecast),
+            patch("lambda_function.fetch_solar_hourly", return_value=solar_hourly),
             patch("lambda_function._fetch_fusionsolar_data", return_value={
-                "soc": soc, "median_consumption": avg_consumption
+                "soc": soc, "median_consumption": median_cons
             }),
         )
 
@@ -788,8 +628,7 @@ class TestPrepareEmail:
         p1, p2, p3 = self._patch_all(winter_data)
         with p1, p2, p3:
             _, subject, _ = prepare_email()
-        valid = ("NO_ACTION", "FORCE_CHARGE", "FORCE_DISCHARGE", "MONITOR")
-        assert any(subject.startswith(a) for a in valid)
+        assert subject.startswith("NO_ACTION") or subject.startswith("RECOMMEND")
 
     def test_subject_contains_date(self, winter_data):
         p1, p2, p3 = self._patch_all(winter_data)
@@ -819,7 +658,7 @@ class TestPrepareEmail:
         assert "2025-01-15" in body
 
     def test_fallback_all_data_missing_no_crash(self, winter_data):
-        p1, p2, p3 = self._patch_all(winter_data, forecast=None, soc=None, avg_consumption=None)
+        p1, p2, p3 = self._patch_all(winter_data, solar_hourly=None, soc=None, median_cons=None)
         with p1, p2, p3:
             _, subject, body = prepare_email()
         assert subject.startswith("NO_ACTION")
@@ -827,7 +666,7 @@ class TestPrepareEmail:
         assert "--- Charging recommendation ---" in body
 
     def test_fallback_partial_data_no_crash(self, winter_data):
-        p1, p2, p3 = self._patch_all(winter_data, forecast=12.5, soc=None, avg_consumption=None)
+        p1, p2, p3 = self._patch_all(winter_data, soc=None, median_cons=None)
         with p1, p2, p3:
             _, subject, body = prepare_email()
         assert subject.startswith("NO_ACTION")
