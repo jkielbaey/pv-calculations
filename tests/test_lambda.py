@@ -7,7 +7,7 @@ from zoneinfo import ZoneInfo
 
 from lambda_function import (
     parse_entries, mark_cheapest, summarize_hours, format_table,
-    fetch_solar_forecast, fetch_current_soc, fetch_avg_daily_consumption,
+    fetch_solar_forecast, fetch_current_soc, fetch_median_daily_consumption,
     _fetch_fusionsolar_data,
     classify_scenario, find_negative_price_window,
     find_cheapest_overnight_window, recommend_action,
@@ -137,7 +137,6 @@ class TestSummarizeHours:
         assert "Summary:" in summary
         assert "Cheapest hour:" in summary
         assert "Cheapest continuous window:" in summary
-        assert "Recommended charging window:" in summary
 
 
 # ── format_table ─────────────────────────────────────────────────────────────
@@ -315,7 +314,7 @@ class TestFetchCurrentSoc:
         assert result is None
 
 
-# ── fetch_avg_daily_consumption ──────────────────────────────────────────────
+# ── fetch_median_daily_consumption ───────────────────────────────────────────
 
 def _consumption_day_response(use_power=None):
     item_map = {} if use_power is None else {"use_power": use_power}
@@ -325,7 +324,7 @@ def _consumption_day_response(use_power=None):
     }).encode()
 
 
-class TestFetchAvgDailyConsumption:
+class TestFetchMedianDailyConsumption:
     def _mock_resp(self, payload, token=None):
         mock_resp = MagicMock()
         mock_resp.read.return_value = payload
@@ -343,36 +342,45 @@ class TestFetchAvgDailyConsumption:
         """Build (payload, None) tuples for day-query responses."""
         return [(_consumption_day_response(v), None) for v in use_powers]
 
-    def test_returns_avg_of_7_days(self):
-        values = [18.0 + i for i in range(7)]  # 18..24
+    def test_returns_median_of_7_days(self):
+        values = [18.0 + i for i in range(7)]  # 18..24, median = 21
         with patch.dict("os.environ", FUSIONSOLAR_ENV):
             with self._mock_urlopen([(LOGIN_RESPONSE, "tok")] + self._day_calls(values)):
-                result = fetch_avg_daily_consumption()
-        assert result == pytest.approx(sum(values) / 7)
+                result = fetch_median_daily_consumption()
+        assert result == pytest.approx(21.0)
+
+    def test_median_ignores_phev_outliers(self):
+        # 5 baseline days + 2 PHEV charging days (much higher)
+        # Sorted: [8.5, 8.8, 9.0, 9.2, 9.5, 27.0, 28.5] → median = 9.2
+        values = [9.0, 9.5, 8.5, 9.2, 8.8, 27.0, 28.5]
+        with patch.dict("os.environ", FUSIONSOLAR_ENV):
+            with self._mock_urlopen([(LOGIN_RESPONSE, "tok")] + self._day_calls(values)):
+                result = fetch_median_daily_consumption()
+        assert result == pytest.approx(9.2)
 
     def test_skips_missing_day(self):
         # 6 days with data, 1 missing (None key in dataItemMap)
         values = [20.0] * 6 + [None]
         with patch.dict("os.environ", FUSIONSOLAR_ENV):
             with self._mock_urlopen([(LOGIN_RESPONSE, "tok")] + self._day_calls(values)):
-                result = fetch_avg_daily_consumption()
+                result = fetch_median_daily_consumption()
         assert result == pytest.approx(20.0)
 
     def test_returns_none_when_all_missing(self):
         with patch.dict("os.environ", FUSIONSOLAR_ENV):
             with self._mock_urlopen([(LOGIN_RESPONSE, "tok")] + self._day_calls([None] * 7)):
-                result = fetch_avg_daily_consumption()
+                result = fetch_median_daily_consumption()
         assert result is None
 
     def test_returns_none_when_env_vars_missing(self):
         with patch.dict("os.environ", {}, clear=True):
-            result = fetch_avg_daily_consumption()
+            result = fetch_median_daily_consumption()
         assert result is None
 
     def test_returns_none_on_network_error(self):
         with patch.dict("os.environ", FUSIONSOLAR_ENV):
             with patch("urllib.request.urlopen", side_effect=OSError("timeout")):
-                result = fetch_avg_daily_consumption()
+                result = fetch_median_daily_consumption()
         assert result is None
 
     def test_retries_on_session_expired(self):
@@ -383,7 +391,7 @@ class TestFetchAvgDailyConsumption:
                 [(LOGIN_RESPONSE, "tok1"), (expired, None),   # login + day1 → expired
                  (LOGIN_RESPONSE, "tok2")] + self._day_calls(values)  # retry from day1
             ):
-                result = fetch_avg_daily_consumption()
+                result = fetch_median_daily_consumption()
         assert result == pytest.approx(20.0)
 
 
@@ -413,13 +421,13 @@ class TestFetchFusionsolarData:
             ) as mock_urlopen:
                 result = _fetch_fusionsolar_data()
         assert result["soc"] == pytest.approx(39.0)
-        assert result["avg_consumption"] == pytest.approx(20.0)
+        assert result["median_consumption"] == pytest.approx(20.0)
         assert mock_urlopen.call_count == 9  # 1 login + 1 SOC + 7 days
 
     def test_returns_null_dict_when_env_missing(self):
         with patch.dict("os.environ", {}, clear=True):
             result = _fetch_fusionsolar_data()
-        assert result == {"soc": None, "avg_consumption": None}
+        assert result == {"soc": None, "median_consumption": None}
 
     def test_retries_both_on_session_expired(self):
         expired = json.dumps({"success": False, "failCode": 305}).encode()
@@ -431,7 +439,7 @@ class TestFetchFusionsolarData:
             ):
                 result = _fetch_fusionsolar_data()
         assert result["soc"] == pytest.approx(39.0)
-        assert result["avg_consumption"] == pytest.approx(20.0)
+        assert result["median_consumption"] == pytest.approx(20.0)
 
 
 # ── M4 helpers ───────────────────────────────────────────────────────────────
@@ -700,7 +708,7 @@ class TestPrepareEmail:
             patch("lambda_function.fetch_prices", return_value=fixture),
             patch("lambda_function.fetch_solar_forecast", return_value=forecast),
             patch("lambda_function._fetch_fusionsolar_data", return_value={
-                "soc": soc, "avg_consumption": avg_consumption
+                "soc": soc, "median_consumption": avg_consumption
             }),
         )
 

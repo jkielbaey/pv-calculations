@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
 import math
+import statistics
 import urllib.request
 import json
 import os
@@ -79,25 +80,25 @@ def _fusionsolar_get_soc(token):
 
 def _fetch_fusionsolar_data(days=7):
     if not all([os.getenv("FUSIONSOLAR_USER"), os.getenv("FUSIONSOLAR_PASSWORD")]):
-        return {"soc": None, "avg_consumption": None}
+        return {"soc": None, "median_consumption": None}
     has_soc = bool(os.getenv("FUSIONSOLAR_DEVICE_ID"))
     has_cons = bool(os.getenv("FUSIONSOLAR_PLANT_ID"))
     def _fetch(token):
         return {
             "soc": _fusionsolar_get_soc(token) if has_soc else None,
-            "avg_consumption": _fusionsolar_get_avg_consumption(token, days) if has_cons else None,
+            "median_consumption": _fusionsolar_get_median_consumption(token, days) if has_cons else None,
         }
     try:
         token = _fusionsolar_login()
         if not token:
-            return {"soc": None, "avg_consumption": None}
+            return {"soc": None, "median_consumption": None}
         try:
             return _fetch(token)
         except _SessionExpired:
             token = _fusionsolar_login()
-            return _fetch(token) if token else {"soc": None, "avg_consumption": None}
+            return _fetch(token) if token else {"soc": None, "median_consumption": None}
     except Exception:
-        return {"soc": None, "avg_consumption": None}
+        return {"soc": None, "median_consumption": None}
 
 
 def fetch_current_soc():
@@ -118,7 +119,7 @@ def fetch_current_soc():
         return None
 
 
-def _fusionsolar_get_avg_consumption(token, days=7):
+def _fusionsolar_get_median_consumption(token, days=7):
     host = os.getenv("FUSIONSOLAR_HOST", "eu5.fusionsolar.huawei.com")
     plant_id = os.getenv("FUSIONSOLAR_PLANT_ID")
     today_utc = datetime.now(ZoneInfo("UTC")).replace(hour=0, minute=0, second=0, microsecond=0)
@@ -144,10 +145,10 @@ def _fusionsolar_get_avg_consumption(token, days=7):
         use_power = entries[0].get("dataItemMap", {}).get("use_power")
         if use_power is not None and use_power > 0:
             values.append(use_power)
-    return sum(values) / len(values) if values else None
+    return statistics.median(values) if values else None
 
 
-def fetch_avg_daily_consumption(days=7):
+def fetch_median_daily_consumption(days=7):
     if not all([os.getenv("FUSIONSOLAR_USER"), os.getenv("FUSIONSOLAR_PASSWORD"), os.getenv("FUSIONSOLAR_PLANT_ID")]):
         return None
     try:
@@ -155,12 +156,12 @@ def fetch_avg_daily_consumption(days=7):
         if not token:
             return None
         try:
-            return _fusionsolar_get_avg_consumption(token, days)
+            return _fusionsolar_get_median_consumption(token, days)
         except _SessionExpired:
             token = _fusionsolar_login()
             if not token:
                 return None
-            return _fusionsolar_get_avg_consumption(token, days)
+            return _fusionsolar_get_median_consumption(token, days)
     except Exception:
         return None
 
@@ -400,7 +401,7 @@ def summarize_hours(marked):
     text.append(f"- Cheapest hour: {best_hour.strftime('%H:%M')} at {best_price:.2f} €/MWh")
     text.append(f"- Cheapest continuous window: {start}–{end} CET")
     text.append("")
-    text.append("Recommended charging window: " + f"{start}–{end} CET")
+    # text.append("Recommended charging window: " + f"{start}–{end} CET")
     text.append("")
 
     return "\n".join(text)
@@ -425,7 +426,7 @@ def explanatory_text():
         "These are the electricity day-ahead prices for Belgium.\n"
         "Each row shows the average price for that hour (CET).\n"
         "Hours marked with an asterisk (*) are the cheapest ten hours of the day.\n"
-        "Those are usually the best times to charge the home battery.\n\n"
+        # "Those are usually the best times to charge the home battery.\n\n"
     )
 
 def prepare_email():
@@ -441,16 +442,16 @@ def prepare_email():
     forecast_kwh = fetch_solar_forecast(target_date)
     fusionsolar = _fetch_fusionsolar_data()
     soc = fusionsolar["soc"]
-    avg_consumption = fusionsolar["avg_consumption"]
+    median_consumption = fusionsolar["median_consumption"]
 
-    if forecast_kwh is not None and soc is not None and avg_consumption is not None:
-        scenario = classify_scenario(forecast_kwh, soc, avg_consumption)
+    if forecast_kwh is not None and soc is not None and median_consumption is not None:
+        scenario = classify_scenario(forecast_kwh, soc, median_consumption)
     else:
         scenario = None
 
     action_result = recommend_action(scenario, hourly, soc, forecast_kwh)
     action = action_result["action"]
-    rec_block = format_recommendation(action_result, scenario, forecast_kwh, soc, avg_consumption)
+    rec_block = format_recommendation(action_result, scenario, forecast_kwh, soc, median_consumption)
 
     subject = f"{action} — Nordpool prices for {target_date}"
     body = explanatory_text() + rec_block + "\n\n" + summarize_hours(marked) + "\n" + format_table(marked)
