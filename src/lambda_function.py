@@ -288,6 +288,32 @@ def recommend_action(scenario, prices, current_soc, forecast_kwh):
     return _no_action
 
 
+def format_recommendation(action_result, scenario, forecast_kwh, soc, avg_consumption):
+    action = action_result["action"]
+    lines = ["--- Charging recommendation ---"]
+    if scenario is not None:
+        lines.append(f"Scenario:  {scenario}")
+    lines.append(f"Action:    {action}")
+    if action_result["start_time"] is not None:
+        start = action_result["start_time"].strftime("%H:%M")
+        end = action_result["end_time"].strftime("%H:%M")
+        lines.append(f"Window:    {start}–{end} CET")
+    if action_result["target_soc"] is not None:
+        lines.append(f"Target:    {action_result['target_soc']}% SOC")
+    if action_result["estimated_saving"] > 0:
+        lines.append(f"Saving:    ~€{action_result['estimated_saving']:.2f}")
+    lines.append(f"Rationale: {action_result['rationale']}")
+    lines.append("")
+    forecast_str = f"{forecast_kwh:.1f} kWh" if forecast_kwh is not None else "unavailable"
+    soc_str = f"{soc:.0f}%" if soc is not None else "unavailable"
+    consumption_str = f"{avg_consumption:.1f} kWh/day" if avg_consumption is not None else "unavailable"
+    lines.append(f"Solar forecast:       {forecast_str}")
+    lines.append(f"Battery SOC now:      {soc_str}")
+    lines.append(f"Avg consumption (7d): {consumption_str}")
+    lines.append("-------------------------------")
+    return "\n".join(lines)
+
+
 def fetch_solar_forecast(date_str):
     key = os.getenv("FORECAST_SOLAR_API_KEY")
     lat = os.getenv("SOLAR_LAT")
@@ -410,27 +436,25 @@ def prepare_email():
     else:
         target_date = (now + timedelta(days=1)).strftime("%Y-%m-%d")
 
-    marked = mark_cheapest(parse_entries(fetch_prices(target_date)))
+    hourly = parse_entries(fetch_prices(target_date))
+    marked = mark_cheapest(hourly)
     forecast_kwh = fetch_solar_forecast(target_date)
     fusionsolar = _fetch_fusionsolar_data()
     soc = fusionsolar["soc"]
     avg_consumption = fusionsolar["avg_consumption"]
 
-    forecast_line = (
-        f"Solar forecast: {forecast_kwh:.1f} kWh\n" if forecast_kwh is not None
-        else "Solar forecast: unavailable\n"
-    )
-    soc_line = (
-        f"Battery SOC: {soc:.0f}%\n" if soc is not None
-        else "Battery SOC: unavailable\n"
-    )
-    consumption_line = (
-        f"Avg daily consumption (7d): {avg_consumption:.1f} kWh\n" if avg_consumption is not None
-        else "Avg daily consumption (7d): unavailable\n"
-    )
+    if forecast_kwh is not None and soc is not None and avg_consumption is not None:
+        scenario = classify_scenario(forecast_kwh, soc, avg_consumption)
+    else:
+        scenario = None
 
-    body = explanatory_text() + forecast_line + soc_line + consumption_line + "\n" + summarize_hours(marked) + "\n" + format_table(marked)
-    return target_date, f"Nordpool prices for {target_date}", body
+    action_result = recommend_action(scenario, hourly, soc, forecast_kwh)
+    action = action_result["action"]
+    rec_block = format_recommendation(action_result, scenario, forecast_kwh, soc, avg_consumption)
+
+    subject = f"{action} — Nordpool prices for {target_date}"
+    body = explanatory_text() + rec_block + "\n\n" + summarize_hours(marked) + "\n" + format_table(marked)
+    return target_date, subject, body
 
 
 def lambda_handler(event, context):

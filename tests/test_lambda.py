@@ -11,6 +11,7 @@ from lambda_function import (
     _fetch_fusionsolar_data,
     classify_scenario, find_negative_price_window,
     find_cheapest_overnight_window, recommend_action,
+    format_recommendation, prepare_email,
 )
 
 BRUSSELS = ZoneInfo("Europe/Brussels")
@@ -613,3 +614,141 @@ class TestRecommendAction:
     def test_rationale_is_nonempty_string(self):
         result = recommend_action("DEFICIT", self._cheap_overnight(), 10.0, 5.0)
         assert isinstance(result["rationale"], str) and len(result["rationale"]) > 0
+
+
+# ── format_recommendation ────────────────────────────────────────────────────
+
+class TestFormatRecommendation:
+    def _force_charge_result(self):
+        base = datetime(2025, 1, 15, tzinfo=BRUSSELS)
+        return {
+            "action": "FORCE_CHARGE",
+            "start_time": base.replace(hour=1),
+            "end_time": base.replace(hour=4),
+            "target_soc": 90,
+            "rationale": "Deficit scenario. Charge 12.0 kWh overnight.",
+            "estimated_saving": 1.40,
+        }
+
+    def _no_action_result(self):
+        return {
+            "action": "NO_ACTION",
+            "start_time": None,
+            "end_time": None,
+            "target_soc": None,
+            "rationale": "No action required.",
+            "estimated_saving": 0.0,
+        }
+
+    def test_contains_header_and_footer(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
+        assert "--- Charging recommendation ---" in text
+        assert "-------------------------------" in text
+
+    def test_contains_scenario_and_action(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
+        assert "DEFICIT" in text
+        assert "FORCE_CHARGE" in text
+
+    def test_contains_window(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
+        assert "01:00" in text
+        assert "04:00" in text
+
+    def test_contains_target_soc(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
+        assert "90%" in text
+
+    def test_contains_saving(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
+        assert "1.40" in text
+
+    def test_contains_data_lines(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, 20.3)
+        assert "12.5 kWh" in text
+        assert "32%" in text
+        assert "20.3 kWh" in text
+
+    def test_none_forecast_shows_unavailable(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", None, 32.0, 20.3)
+        assert "unavailable" in text
+
+    def test_none_soc_shows_unavailable(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, None, 20.3)
+        assert "unavailable" in text
+
+    def test_none_consumption_shows_unavailable(self):
+        text = format_recommendation(self._force_charge_result(), "DEFICIT", 12.5, 32.0, None)
+        assert "unavailable" in text
+
+    def test_no_action_no_window_lines(self):
+        text = format_recommendation(self._no_action_result(), None, None, None, None)
+        assert "NO_ACTION" in text
+        assert "Window:" not in text
+        assert "Target:" not in text
+
+    def test_no_action_no_scenario_line_when_none(self):
+        text = format_recommendation(self._no_action_result(), None, None, None, None)
+        assert "Scenario:" not in text
+
+
+# ── prepare_email ────────────────────────────────────────────────────────────
+
+class TestPrepareEmail:
+    def _patch_all(self, fixture, forecast=12.5, soc=32.0, avg_consumption=20.3):
+        return (
+            patch("lambda_function.fetch_prices", return_value=fixture),
+            patch("lambda_function.fetch_solar_forecast", return_value=forecast),
+            patch("lambda_function._fetch_fusionsolar_data", return_value={
+                "soc": soc, "avg_consumption": avg_consumption
+            }),
+        )
+
+    def test_subject_has_action_prefix(self, winter_data):
+        p1, p2, p3 = self._patch_all(winter_data)
+        with p1, p2, p3:
+            _, subject, _ = prepare_email()
+        valid = ("NO_ACTION", "FORCE_CHARGE", "FORCE_DISCHARGE", "MONITOR")
+        assert any(subject.startswith(a) for a in valid)
+
+    def test_subject_contains_date(self, winter_data):
+        p1, p2, p3 = self._patch_all(winter_data)
+        with p1, p2, p3:
+            date, subject, _ = prepare_email()
+        assert date in subject
+
+    def test_body_contains_recommendation_block(self, winter_data):
+        p1, p2, p3 = self._patch_all(winter_data)
+        with p1, p2, p3:
+            _, _, body = prepare_email()
+        assert "--- Charging recommendation ---" in body
+
+    def test_recommendation_before_price_table(self, winter_data):
+        p1, p2, p3 = self._patch_all(winter_data)
+        with p1, p2, p3:
+            _, _, body = prepare_email()
+        rec_pos = body.find("--- Charging recommendation ---")
+        table_pos = body.find("Hour (CET)")
+        assert rec_pos < table_pos
+
+    def test_body_contains_price_table(self, winter_data):
+        p1, p2, p3 = self._patch_all(winter_data)
+        with p1, p2, p3:
+            _, _, body = prepare_email()
+        assert "Hour (CET)" in body
+        assert "2025-01-15" in body
+
+    def test_fallback_all_data_missing_no_crash(self, winter_data):
+        p1, p2, p3 = self._patch_all(winter_data, forecast=None, soc=None, avg_consumption=None)
+        with p1, p2, p3:
+            _, subject, body = prepare_email()
+        assert subject.startswith("NO_ACTION")
+        assert "Hour (CET)" in body
+        assert "--- Charging recommendation ---" in body
+
+    def test_fallback_partial_data_no_crash(self, winter_data):
+        p1, p2, p3 = self._patch_all(winter_data, forecast=12.5, soc=None, avg_consumption=None)
+        with p1, p2, p3:
+            _, subject, body = prepare_email()
+        assert subject.startswith("NO_ACTION")
+        assert "Hour (CET)" in body
