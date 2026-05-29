@@ -6,9 +6,11 @@ from datetime import datetime, timedelta
 from collections import defaultdict
 from zoneinfo import ZoneInfo
 import boto3
-from dotenv import load_dotenv
-
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 BRUSSELS = ZoneInfo("Europe/Brussels")
 
