@@ -10,12 +10,20 @@ from lambda_function import (
     fetch_solar_forecast, fetch_solar_hourly,
     fetch_current_soc, fetch_median_daily_consumption,
     _fetch_fusionsolar_data,
+    _fusionsolar_token_cache_read, _fusionsolar_token_cache_write,
+    _fusionsolar_token_cache_invalidate, _TOKEN_CACHE_PATH, _TOKEN_TTL_SECONDS,
     format_recommendation, prepare_email,
     simulate_day, recommend, MIN_NET_BENEFIT_EUR,
 )
 
 BRUSSELS = ZoneInfo("Europe/Brussels")
 FIXTURES = Path(__file__).parent / "fixtures"
+
+
+@pytest.fixture(autouse=True)
+def _isolate_token_cache(tmp_path):
+    with patch("lambda_function._TOKEN_CACHE_PATH", str(tmp_path / "token.json")):
+        yield
 
 
 def load_fixture(name):
@@ -224,6 +232,38 @@ class TestFetchSolarForecast:
             with self._mock_urlopen(b"not-json"):
                 result = fetch_solar_forecast("2025-07-15")
         assert result is None
+
+
+# ── token cache ──────────────────────────────────────────────────────────────
+
+class TestFusionSolarTokenCache:
+    def test_write_then_read_returns_token(self, tmp_path):
+        cache = str(tmp_path / "token.json")
+        with patch("lambda_function._TOKEN_CACHE_PATH", cache):
+            _fusionsolar_token_cache_write("abc123")
+            assert _fusionsolar_token_cache_read() == "abc123"
+
+    def test_expired_token_returns_none(self, tmp_path):
+        cache = str(tmp_path / "token.json")
+        old_ts = datetime.now().timestamp() - _TOKEN_TTL_SECONDS - 1
+        (tmp_path / "token.json").write_text(json.dumps({"token": "old", "ts": old_ts}))
+        with patch("lambda_function._TOKEN_CACHE_PATH", cache):
+            assert _fusionsolar_token_cache_read() is None
+
+    def test_missing_file_returns_none(self, tmp_path):
+        with patch("lambda_function._TOKEN_CACHE_PATH", str(tmp_path / "missing.json")):
+            assert _fusionsolar_token_cache_read() is None
+
+    def test_invalidate_removes_file(self, tmp_path):
+        cache = tmp_path / "token.json"
+        cache.write_text(json.dumps({"token": "x", "ts": datetime.now().timestamp()}))
+        with patch("lambda_function._TOKEN_CACHE_PATH", str(cache)):
+            _fusionsolar_token_cache_invalidate()
+        assert not cache.exists()
+
+    def test_invalidate_is_safe_when_no_file(self, tmp_path):
+        with patch("lambda_function._TOKEN_CACHE_PATH", str(tmp_path / "missing.json")):
+            _fusionsolar_token_cache_invalidate()  # must not raise
 
 
 # ── fetch_current_soc ─────────────────────────────────────────────────────────
@@ -565,6 +605,8 @@ class TestFormatRecommendation:
         assert "11:00" in text
         assert "15:00" in text  # end_hour 14 + 1 = 15
         assert "7.20" in text
+        assert "18.5 kWh" in text
+        assert "9.0 kWh/day" in text
 
     def test_recommend_lists_both_levers(self):
         text = format_recommendation(self._recommend_result(), soc=32.0,
@@ -582,6 +624,21 @@ class TestFormatRecommendation:
         text = format_recommendation(self._recommend_result(), soc=32.0,
                                      baseline_consumption=9.0, solar_forecast_kwh=18.5)
         assert "6.00" in text
+
+    def test_insufficient_data_shows_data_unavailable_message(self):
+        result = {
+            "action": "NO_ACTION",
+            "baseline_cost_eur": 0.0,
+            "negative_hours": [],
+            "avg_negative_price_eur_per_mwh": 0.0,
+            "recommendations": [],
+            "combined_benefit_eur": 0.0,
+            "rationale": "Insufficient data.",
+        }
+        text = format_recommendation(result, soc=None, baseline_consumption=None,
+                                     solar_forecast_kwh=None)
+        assert "unavailable" in text.lower() or "data" in text.lower()
+        assert "prices today are positive" not in text
 
     def test_no_action_shows_baseline_cost(self):
         text = format_recommendation(self._no_action_result(baseline_cost=0.40),

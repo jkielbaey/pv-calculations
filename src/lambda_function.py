@@ -38,7 +38,40 @@ class _SessionExpired(Exception):
     pass
 
 
+_TOKEN_CACHE_PATH = "/tmp/fusionsolar_token.json"
+_TOKEN_TTL_SECONDS = 1500  # 25 minutes
+
+
+def _fusionsolar_token_cache_read():
+    try:
+        with open(_TOKEN_CACHE_PATH) as f:
+            cached = json.load(f)
+        if datetime.now().timestamp() - cached["ts"] < _TOKEN_TTL_SECONDS:
+            return cached["token"]
+    except (OSError, KeyError, json.JSONDecodeError):
+        pass
+    return None
+
+
+def _fusionsolar_token_cache_write(token):
+    try:
+        with open(_TOKEN_CACHE_PATH, "w") as f:
+            json.dump({"token": token, "ts": datetime.now().timestamp()}, f)
+    except OSError:
+        pass
+
+
+def _fusionsolar_token_cache_invalidate():
+    try:
+        os.remove(_TOKEN_CACHE_PATH)
+    except OSError:
+        pass
+
+
 def _fusionsolar_login():
+    cached = _fusionsolar_token_cache_read()
+    if cached:
+        return cached
     host = os.getenv("FUSIONSOLAR_HOST", "eu5.fusionsolar.huawei.com")
     user = os.getenv("FUSIONSOLAR_USER")
     pwd = os.getenv("FUSIONSOLAR_PASSWORD")
@@ -53,7 +86,10 @@ def _fusionsolar_login():
         data = json.loads(resp.read())
         if not data.get("success"):
             return None
-        return resp.headers.get("xsrf-token")
+        token = resp.headers.get("xsrf-token")
+    if token:
+        _fusionsolar_token_cache_write(token)
+    return token
 
 
 def _fusionsolar_get_soc(token):
@@ -95,6 +131,7 @@ def _fetch_fusionsolar_data(days=7):
         try:
             return _fetch(token)
         except _SessionExpired:
+            _fusionsolar_token_cache_invalidate()
             token = _fusionsolar_login()
             return _fetch(token) if token else {"soc": None, "median_consumption": None}
     except Exception:
@@ -111,6 +148,7 @@ def fetch_current_soc():
         try:
             return _fusionsolar_get_soc(token)
         except _SessionExpired:
+            _fusionsolar_token_cache_invalidate()
             token = _fusionsolar_login()
             if not token:
                 return None
@@ -341,8 +379,13 @@ def format_recommendation(result, soc, baseline_consumption, solar_forecast_kwh)
             start = f"{min(neg):02d}:00"
             end = f"{max(neg) + 1:02d}:00"
             avg = result.get("avg_negative_price_eur_per_mwh", 0.0)
-            lines.append(f"Negative-price window: {start}–{end} CET (avg {avg:.0f} €/MWh)")
-        lines.append(f"Expected loss without action: €{result['baseline_cost_eur']:.2f}")
+            solar_str = f"{solar_forecast_kwh:.1f} kWh" if solar_forecast_kwh is not None else "unknown"
+            cons_str = f"{baseline_consumption:.1f} kWh/day" if baseline_consumption is not None else "unknown"
+            lines.append(
+                f"Prices drop to {avg:.0f} €/MWh during {start}–{end} CET. "
+                f"With {solar_str} solar forecast and typical use of {cons_str}, "
+                f"grid-feed costs could reach €{result['baseline_cost_eur']:.2f} without action."
+            )
         lines.append("")
         lines.append("Recommended:")
         for rec in result["recommendations"]:
@@ -361,10 +404,32 @@ def format_recommendation(result, soc, baseline_consumption, solar_forecast_kwh)
                 )
         lines.append(f"Total expected benefit: ~€{result['combined_benefit_eur']:.2f}")
     else:
-        rationale = result.get("rationale") or "No action needed."
-        lines.append(rationale)
-        if result.get("baseline_cost_eur", 0) > 0:
-            lines.append(f"Expected feed cost: €{result['baseline_cost_eur']:.2f}")
+        neg = result.get("negative_hours", [])
+        rationale = result.get("rationale", "")
+        if "Insufficient data" in rationale:
+            lines.append("Some data is unavailable — no recommendation can be generated.")
+        elif not neg:
+            lines.append("All prices today are positive — no grid-feed cost risk. No action needed.")
+        else:
+            start = f"{min(neg):02d}:00"
+            end = f"{max(neg) + 1:02d}:00"
+            avg = result.get("avg_negative_price_eur_per_mwh", 0.0)
+            cost = result.get("baseline_cost_eur", 0.0)
+            solar_str = f"{solar_forecast_kwh:.1f} kWh" if solar_forecast_kwh is not None else "unknown"
+            cons_str = f"{baseline_consumption:.1f} kWh/day" if baseline_consumption is not None else "unknown"
+            lines.append(f"Prices dip to {avg:.0f} €/MWh during {start}–{end} CET.")
+            lines.append(
+                f"Solar forecast ({solar_str}) likely exceeds typical use ({cons_str}), "
+                f"but the expected grid-feed cost is only €{cost:.2f} — "
+                f"below the €{MIN_NET_BENEFIT_EUR:.0f} threshold. No action needed."
+            )
+            if "No action combination" in rationale:
+                lines[-1] = (
+                    f"Solar forecast ({solar_str}) likely exceeds typical use ({cons_str}). "
+                    f"Expected grid-feed cost: €{cost:.2f}. "
+                    f"Even with PHEV charging and battery pre-discharge, the combined benefit "
+                    f"stays below €{MIN_NET_BENEFIT_EUR:.0f}. No action needed."
+                )
 
     lines.append("")
     forecast_str = f"{solar_forecast_kwh:.1f} kWh" if solar_forecast_kwh is not None else "unavailable"
@@ -519,7 +584,8 @@ def explanatory_text():
         "These are the electricity day-ahead prices for Belgium.\n"
         "Each row shows the average price for that hour (CET).\n"
         "Hours marked with an asterisk (*) are the cheapest ten hours of the day.\n"
-        # "Those are usually the best times to charge the home battery.\n\n"
+        # "Those are usually the best times to charge the home battery.\n"
+        "\n"
     )
 
 def prepare_email():
